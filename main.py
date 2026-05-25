@@ -1,5 +1,6 @@
 import telebot
 from telebot import types
+import psycopg2
 from psycopg2 import pool
 import time
 import logging
@@ -656,4 +657,3 @@ if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
     threading.Thread(target=keep_alive, daemon=True).start()
     run_bot()
-
