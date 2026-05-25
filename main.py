@@ -1,13 +1,13 @@
 import telebot
-from telebot import types
-import psycopg2
+from telebot import type
 from psycopg2 import pool
 import time
-import logging
+import logaaaaaaaging
 import os
 from flask import Flask
 import threading
 from concurrent.futures import ThreadPoolExecutor
+import urllib.request
 
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS_ENV = [int(x.strip()) for x in os.getenv("ADMIN_ID", "0").split(",") if x.strip().isdigit()]
@@ -81,9 +81,26 @@ def init_db():
             added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    db_execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     for aid in ADMIN_IDS_ENV:
         db_execute("INSERT INTO admins (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (aid,))
+    if CHANNEL:
+        db_execute(
+            "INSERT INTO settings (key, value) VALUES ('channel', %s) ON CONFLICT (key) DO NOTHING",
+            (CHANNEL,)
+        )
     logging.info("Database tayyor ✅")
+
+def get_channel():
+    row = db_execute("SELECT value FROM settings WHERE key = 'channel'", fetchone=True)
+    if row:
+        return row[0]
+    return CHANNEL
 
 admin_states = {}
 
@@ -97,10 +114,11 @@ def is_main_admin(user_id):
     return user_id == MAIN_ADMIN_ID
 
 def check_sub(user_id):
-    if not CHANNEL:
+    ch = get_channel()
+    if not ch:
         return True
     try:
-        status = bot.get_chat_member(CHANNEL, user_id).status
+        status = bot.get_chat_member(ch, user_id).status
         return status in ["member", "administrator", "creator"]
     except Exception as e:
         logging.error(f"Sub check error: {e}")
@@ -113,8 +131,9 @@ def safe_send(chat_id, text, **kwargs):
         logging.error(f"Send error: {e}")
 
 def sub_keyboard():
+    ch = get_channel()
     kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("📢 Kanalga obuna", url=f"https://t.me/{CHANNEL[1:]}"))
+    kb.add(types.InlineKeyboardButton("📢 Kanalga obuna", url=f"https://t.me/{ch[1:]}"))
     kb.add(types.InlineKeyboardButton("✅ Tekshirish", callback_data="check_sub"))
     return kb
 
@@ -123,6 +142,7 @@ def admin_keyboard():
     kb.add("➕ Kino qo'shish", "🗑 Kino o'chirish")
     kb.add("📊 Statistika", "📋 Kinolar ro'yxati")
     kb.add("👥 Userlar", "📨 Reklama yuborish")
+    kb.add("⚙️ Sozlamalar")
     return kb
 
 @bot.message_handler(commands=['addadmin'])
@@ -176,6 +196,40 @@ def list_admins_cmd(msg):
 @bot.message_handler(commands=['myid'])
 def my_id_cmd(msg):
     safe_send(msg.chat.id, f"🆔 Sizning ID: <code>{msg.from_user.id}</code>", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: is_admin(m.from_user.id) and m.text == "⚙️ Sozlamalar")
+def settings_menu(msg):
+    ch = get_channel()
+    if ch:
+        text = f"⚙️ <b>Sozlamalar</b>\n\n📢 Hozirgi kanal: <b>{ch}</b>"
+    else:
+        text = "⚙️ <b>Sozlamalar</b>\n\n📢 Kanal: <b>Ulanmagan</b>"
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("📢 Kanal qo'shish / o'zgartirish", callback_data="kanal_set"))
+    if ch:
+        kb.add(types.InlineKeyboardButton("❌ Kanalni o'chirish", callback_data="kanal_remove"))
+    safe_send(msg.chat.id, text, parse_mode="HTML", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data == "kanal_set")
+def kanal_set_callback(call):
+    if not is_admin(call.from_user.id):
+        return
+    admin_states[call.from_user.id] = {"step": "kanal_set"}
+    bot.answer_callback_query(call.id)
+    safe_send(call.message.chat.id,
+        "📢 Kanal username ni yuboring:\n\n"
+        "Misol: <code>@mening_kanalim</code>\n\n"
+        "❌ Bekor qilish uchun /start bosing",
+        parse_mode="HTML"
+    )
+
+@bot.callback_query_handler(func=lambda c: c.data == "kanal_remove")
+def kanal_remove_callback(call):
+    if not is_admin(call.from_user.id):
+        return
+    db_execute("DELETE FROM settings WHERE key = 'channel'")
+    bot.answer_callback_query(call.id, "✅ Kanal o'chirildi!")
+    safe_send(call.message.chat.id, "✅ Kanal o'chirildi! Endi obuna tekshiruvi yo'q.")
 
 @bot.message_handler(commands=['start'])
 def start(msg):
@@ -495,6 +549,28 @@ def admin_steps(msg):
         safe_send(msg.chat.id, text, parse_mode="HTML", reply_markup=kb)
         del admin_states[msg.from_user.id]
 
+    elif step == "kanal_set":
+        username = msg.text.strip()
+        if not username.startswith("@"):
+            username = "@" + username
+        try:
+            bot.get_chat(username)
+            db_execute(
+                "INSERT INTO settings (key, value) VALUES ('channel', %s) ON CONFLICT (key) DO UPDATE SET value = %s",
+                (username, username)
+            )
+            safe_send(msg.chat.id,
+                f"✅ Kanal muvaffaqiyatli ulandi!\n\n📢 Kanal: <b>{username}</b>\n\nEndi userlar shu kanalga obuna bo'lmasa botdan foydalana olmaydi.",
+                parse_mode="HTML",
+                reply_markup=admin_keyboard()
+            )
+        except Exception as e:
+            safe_send(msg.chat.id,
+                f"❌ Kanal topilmadi!\n\nMisol: <code>@mening_kanalim</code>\n\n⚠️ Bot kanalga admin qilinganligini tekshiring.",
+                parse_mode="HTML"
+            )
+        del admin_states[msg.from_user.id]
+
     elif step == "send_to_user":
         target_id = state["data"]["target_id"]
         try:
@@ -541,7 +617,7 @@ def get_movie(msg):
     if movie:
         name, file_id = movie
         try:
-            bot.send_video(msg.chat.id, file_id, caption=f"🎬 <b>{name}</b>\n\n📢 {CHANNEL}", parse_mode="HTML")
+            bot.send_video(msg.chat.id, file_id, caption=f"🎬 <b>{name}</b>\n\n📢 {get_channel()}", parse_mode="HTML")
             db_execute("UPDATE movies SET views = views + 1 WHERE code = %s", (code,))
         except Exception as e:
             logging.error(f"Video send error: {e}")
@@ -552,6 +628,19 @@ def get_movie(msg):
                 safe_send(msg.chat.id, "❌ Kino yuborishda xatolik")
     else:
         safe_send(msg.chat.id, "❌ Bunday kodli kino topilmadi")
+
+def keep_alive():
+    render_url = os.getenv("RENDER_EXTERNAL_URL", "")
+    if not render_url:
+        logging.info("RENDER_EXTERNAL_URL topilmadi, keep-alive o'chirildi")
+        return
+    while True:
+        try:
+            time.sleep(14 * 60)
+            urllib.request.urlopen(render_url + "/health", timeout=10)
+            logging.info("Keep-alive ping yuborildi ✅")
+        except Exception as e:
+            logging.warning(f"Keep-alive xato: {e}")
 
 def run_bot():
     while True:
@@ -565,4 +654,6 @@ def run_bot():
 if __name__ == "__main__":
     init_db()
     threading.Thread(target=run_web, daemon=True).start()
+    threading.Thread(target=keep_alive, daemon=True).start()
     run_bot()
+
