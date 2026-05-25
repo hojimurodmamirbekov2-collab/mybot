@@ -1,5 +1,5 @@
 import telebot
-from telebot import type
+from telebot import types
 from psycopg2 import pool
 import time
 import logaaaaaaaging
