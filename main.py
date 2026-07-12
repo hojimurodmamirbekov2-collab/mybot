@@ -1,11 +1,3 @@
-  BOT_TOKEN             = 
-  TMDB_API_KEY          = themoviedb.org/settings/api (kino uchun)
-  SPOTIFY_CLIENT_ID     = developer.spotify.com (ixtiyoriy)
-  SPOTIFY_CLIENT_SECRET = (ixtiyoriy)
-  GENIUS_TOKEN          = genius.com/api-clients (ixtiyoriy)
-  ADMIN_IDS             = 123456789,987654321   (vergul bilan)
-"""
-
 import os, re, time, asyncio, tempfile, subprocess, json
 from io import BytesIO
 from datetime import datetime
