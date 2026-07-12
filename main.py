@@ -1,3 +1,4 @@
+
 import os, re, time, asyncio, tempfile, subprocess, json
 from io import BytesIO
 from datetime import datetime
@@ -38,10 +39,6 @@ try:
 except ImportError:
     YTSEARCH_OK = False
 
-# ═══════════════════════════════════════════════════════════
-# KONFIGURATSIYA
-# ═══════════════════════════════════════════════════════════
-
 BOT_TOKEN             = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 TMDB_API_KEY          = os.getenv("TMDB_API_KEY", "")
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -57,10 +54,9 @@ for _a in ADMIN_IDS_RAW.split(","):
 TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG  = "https://image.tmdb.org/t/p/w500"
 
-# ─── In-memory storage ────────────────────────────────────
 STATS: dict     = defaultdict(lambda: {"dl": 0, "music": 0, "movies": 0, "effects": 0, "joined": ""})
-USER_INFO: dict = {}   # uid → {"name": str, "username": str, "banned": bool}
-BROADCAST_MSG   = {}   # temp storage
+USER_INFO: dict = {}
+BROADCAST_MSG   = {}
 
 AUDIO_EFFECTS = {
     "bass":   "🔊 Bass Boost",
@@ -85,10 +81,6 @@ PLATFORMS = [
     ("🤖 Reddit",    "https://reddit.com"),
     ("🎬 Dailymot.", "https://dailymotion.com"),
 ]
-
-# ═══════════════════════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════════════════════
 
 def is_url(t: str) -> bool:
     return bool(re.match(r"https?://", t.strip()))
@@ -148,8 +140,6 @@ def gn():
         except: pass
     return None
 
-# ─── ffmpeg ───────────────────────────────────────────────
-
 def run_ff(args: list) -> bool:
     return subprocess.run(["ffmpeg", "-y"] + args, capture_output=True).returncode == 0
 
@@ -185,8 +175,6 @@ def fx(audio: AudioSegment, eid: str) -> AudioSegment:
         audio = audio.low_pass_filter(3000) - 3
         audio = audio._spawn(audio.raw_data, overrides={"frame_rate": int(audio.frame_rate * 0.95)}).set_frame_rate(audio.frame_rate)
     return normalize(audio)
-
-# ─── yt-dlp ───────────────────────────────────────────────
 
 def _dl_sync(url: str, audio_only: bool, quality: str = "best") -> dict:
     fmt = "bestaudio/best"
@@ -233,8 +221,6 @@ async def ydl(url: str, audio_only: bool, quality: str = "best") -> dict:
     return await asyncio.get_event_loop().run_in_executor(
         None, _dl_sync, url, audio_only, quality)
 
-# ─── TMDB ─────────────────────────────────────────────────
-
 async def tmdb(path: str, params: dict | None = None) -> dict | None:
     if not TMDB_API_KEY: return None
     p = {"api_key": TMDB_API_KEY, "language": "en-US", **(params or {})}
@@ -264,8 +250,6 @@ async def tmdb_img(poster: str) -> bytes | None:
 async def tmdb_trending() -> list:
     d = await tmdb("/trending/all/week")
     return (d or {}).get("results", [])[:8]
-
-# ─── Reverse image search ─────────────────────────────────
 
 async def yandex_reverse(img: bytes) -> str | None:
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -306,10 +290,6 @@ async def google_lens(img: bytes) -> str | None:
             return movie[0] if movie else (ts[0] if ts else None)
     except: return None
 
-# ═══════════════════════════════════════════════════════════
-# ★ START — Chiroyli tugmachalar
-# ═══════════════════════════════════════════════════════════
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     register_user(user)
@@ -325,7 +305,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔽 Kerakli platformani tanlang:"
     )
 
-    # Platform tugmalari (2 dona qatoriga)
     plat_kb = []
     row = []
     for name, _ in PLATFORMS:
@@ -334,7 +313,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             plat_kb.append(row); row = []
     if row: plat_kb.append(row)
 
-    # Asosiy funksiyalar
     plat_kb.append([
         InlineKeyboardButton("🎵 Musiqa yuklab olish", callback_data="MENU|music"),
         InlineKeyboardButton("🎬 Kino qidirish",       callback_data="MENU|movie"),
@@ -486,12 +464,7 @@ async def back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await query.message.delete()
-    # /start ni qayta yuborish
     await cmd_start.__wrapped__(update, context) if hasattr(cmd_start, "__wrapped__") else None
-
-# ═══════════════════════════════════════════════════════════
-# VIDEO DOWNLOAD
-# ═══════════════════════════════════════════════════════════
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
@@ -607,10 +580,6 @@ async def _video_info(query, url: str, msg):
     except Exception as e:
         await msg.edit_text(f"❌ {str(e)[:200]}")
 
-# ═══════════════════════════════════════════════════════════
-# MUSIQA
-# ═══════════════════════════════════════════════════════════
-
 async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if is_banned(uid): return
@@ -693,10 +662,6 @@ async def music_dl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.edit_text(f"❌ {str(e)[:200]}")
 
-# ═══════════════════════════════════════════════════════════
-# LYRICS
-# ═══════════════════════════════════════════════════════════
-
 async def cmd_lyrics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_banned(update.effective_user.id): return
     if not context.args:
@@ -730,10 +695,6 @@ async def cmd_lyrics(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else: await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         await msg.edit_text(f"❌ {str(e)[:200]}")
-
-# ═══════════════════════════════════════════════════════════
-# KINO
-# ═══════════════════════════════════════════════════════════
 
 def _movie_text(d: dict) -> str:
     title    = d.get("title") or d.get("name") or "?"
@@ -847,8 +808,6 @@ async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
             callback_data=f"MOV|{r['id']}|{mt}")])
     await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
 
-# ─── Rasmdan kino topish ──────────────────────────────────
-
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if is_banned(uid): return
@@ -921,10 +880,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.edit_text(f"❌ Xato: {str(e)[:200]}")
 
-# ═══════════════════════════════════════════════════════════
-# AUDIO EFFECTS
-# ═══════════════════════════════════════════════════════════
-
 async def cmd_effect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_banned(update.effective_user.id): return
     context.user_data["effect_waiting"] = True
@@ -991,10 +946,6 @@ async def _do_effect(update: Update, context: ContextTypes.DEFAULT_TYPE, af) -> 
         await msg.edit_text(f"❌ {str(e)[:200]}")
     return True
 
-# ═══════════════════════════════════════════════════════════
-# CIRCLE VIDEO
-# ═══════════════════════════════════════════════════════════
-
 async def cmd_circle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_banned(update.effective_user.id): return
     context.user_data["circle_waiting"] = True
@@ -1027,10 +978,6 @@ async def _do_circle(update: Update, context: ContextTypes.DEFAULT_TYPE, vf) -> 
     except Exception as e:
         await msg.edit_text(f"❌ {str(e)[:200]}")
     return True
-
-# ═══════════════════════════════════════════════════════════
-# ★ ADMIN PANEL — To'liq kuchli
-# ═══════════════════════════════════════════════════════════
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1079,7 +1026,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     back_kb = [[InlineKeyboardButton("⬅️ Admin panel", callback_data="ADM|back|0")]]
 
     if action == "back":
-        # Admin panelni qayta ko'rsatish
         total = len(USER_INFO)
         banned = sum(1 for u in USER_INFO.values() if u.get("banned"))
         total_dl = sum(v["dl"] for v in STATS.values())
@@ -1140,9 +1086,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "🚫 Bloklandi" if USER_INFO[target_id]["banned"] else "✅ Blokdan chiqarildi"
         uname = USER_INFO[target_id].get("name", str(target_id))
         await query.answer(f"{status}: {uname}", show_alert=True)
-        # Sahifani yangilash
-        await admin_callback(update, context)  # users ni qayta ko'rsatish
-        # Back to users page 1
+        await admin_callback(update, context)
         parts[2] = "1"
         query.data = "ADM|users|1"
         await admin_callback(update, context)
@@ -1246,15 +1190,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text("✅ Barcha statistika tozalandi.",
             reply_markup=InlineKeyboardMarkup(back_kb))
 
-# ═══════════════════════════════════════════════════════════
-# ADMIN — Broadcast va User message handling
-# ═══════════════════════════════════════════════════════════
-
 async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     uid = update.effective_user.id
     if not is_admin(uid): return False
 
-    # Broadcast mode
     if context.user_data.get("broadcast_mode"):
         context.user_data["broadcast_mode"] = False
         targets = [u_id for u_id, u in USER_INFO.items()
@@ -1273,7 +1212,6 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode=ParseMode.MARKDOWN)
         return True
 
-    # Individual user message
     if context.user_data.get("msg_to_user"):
         t_id = context.user_data.pop("msg_to_user")
         try:
@@ -1284,7 +1222,6 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text(f"❌ Yuborib bo'lmadi: {e}")
         return True
 
-    # Admin search
     if context.user_data.get("admin_search"):
         context.user_data["admin_search"] = False
         q = (update.message.text or "").strip()
@@ -1319,10 +1256,6 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     return False
 
-# ═══════════════════════════════════════════════════════════
-# UNIVERSAL MESSAGE HANDLER
-# ═══════════════════════════════════════════════════════════
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message: return
     user = update.effective_user
@@ -1333,17 +1266,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🚫 Siz bloklangansiz.")
         return
 
-    # Admin actions (broadcast, search, msg_to_user)
     if is_admin(uid):
         handled = await admin_text_handler(update, context)
         if handled: return
 
-    # Photo → kino topish
     if update.message.photo:
         await handle_photo(update, context)
         return
 
-    # Audio → effekt
     af = update.message.audio or update.message.voice
     if not af and update.message.document:
         mt = update.message.document.mime_type or ""
@@ -1352,7 +1282,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         handled = await _do_effect(update, context, af)
         if handled: return
 
-    # Video → aylana
     vf = update.message.video
     if not vf and update.message.document:
         mt = update.message.document.mime_type or ""
@@ -1361,13 +1290,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         handled = await _do_circle(update, context, vf)
         if handled: return
 
-    # URL → yuklab olish
     text = (update.message.text or "").strip()
     if is_url(text):
         await handle_url(update, context)
         return
 
-    # Boshqa matn
     if text and not text.startswith("/"):
         await update.message.reply_text(
             "💡 Nima yuborishni bilmadim.\n\n"
@@ -1378,10 +1305,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(context.error, (TimedOut, NetworkError)): return
     print(f"[ERR] {context.error}")
-
-# ═══════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════
 
 def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
