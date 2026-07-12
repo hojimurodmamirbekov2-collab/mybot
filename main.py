@@ -1,11 +1,4 @@
-"""
-╔══════════════════════════════════════════════════════════╗
-║              PRO MEDIA BOT  v3.0                         ║
-║  Video • Musiqa • Kino • Effektlar • Admin Panel         ║
-╚══════════════════════════════════════════════════════════╝
-
-.env fayli:
-  BOT_TOKEN             = @BotFather dan (MAJBURIY)
+  BOT_TOKEN             = 
   TMDB_API_KEY          = themoviedb.org/settings/api (kino uchun)
   SPOTIFY_CLIENT_ID     = developer.spotify.com (ixtiyoriy)
   SPOTIFY_CLIENT_SECRET = (ixtiyoriy)
