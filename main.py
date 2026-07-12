@@ -130,9 +130,9 @@ def yuborish(chat_id, matn, **kw):
 
 def user_kb():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("📥 Video yuklab olish", "🎵 Musiqa yuklab olish")
-    kb.add("🔍 Musiqa qidirish",    "🔵 Dumaloq video")
-    kb.add("🖼 Rasm orqali kino topish")
+    kb.add("📥 Video yuklab olish",    "🎵 Musiqa yuklab olish")
+    kb.add("🔍 Musiqa qidirish",       "🔵 Dumaloq video")
+    kb.add("🖼 Rasm orqali kino topish", "🎞 Video orqali kino topish")
     return kb
 
 def admin_kb(uid=None):
@@ -207,6 +207,51 @@ def effekt_qollan(kirish, filtr):
     except Exception as e: log.error(e)
     return None
 
+def video_kadr_ol(video_fayl):
+    chiq = f"/tmp/kadr_{int(time.time()*1000)}.jpg"
+    try:
+        r = subprocess.run(
+            ["ffmpeg","-y","-i",video_fayl,"-ss","00:00:03","-frames:v","1","-q:v","2",chiq],
+            capture_output=True, timeout=30
+        )
+        if os.path.exists(chiq) and os.path.getsize(chiq) > 0:
+            return chiq
+        r2 = subprocess.run(
+            ["ffmpeg","-y","-i",video_fayl,"-frames:v","1","-q:v","2",chiq],
+            capture_output=True, timeout=30
+        )
+        if os.path.exists(chiq) and os.path.getsize(chiq) > 0:
+            return chiq
+    except Exception as e:
+        log.error(e)
+    return None
+
+def kino_qidirish_natija(chat_id, img_fayl, yukl_xabar_id=None):
+    topilgan = rasmdan_aniqla(img_fayl)
+    try: os.remove(img_fayl)
+    except: pass
+    if yukl_xabar_id:
+        try: bot.delete_message(chat_id, yukl_xabar_id)
+        except: pass
+    if not topilgan:
+        yuborish(chat_id, "❌ Kino aniqlanmadi.\n💡 Aniqroq rasm yoki video kadri yuboring."); return
+    baza = []
+    for t in topilgan:
+        for r in bazadan_qidirish(t):
+            if r not in baza: baza.append(r)
+    matn = f"🔍 <b>Aniqlangan:</b> <i>{topilgan[0]}</i>\n\n"
+    if baza:
+        matn += "🎬 <b>Botdagi kinolar:</b>\n\n"
+        for kod,nom,pid,ko in baza[:5]:
+            matn += f"🔢 Kod: <code>{kod}</code>  —  {nom}  👁{ko}\n"
+        matn += "\n📩 <b>Kodni yuboring → kino keladi!</b>"
+        if baza[0][2]:
+            try: bot.send_photo(chat_id, baza[0][2], caption=matn, parse_mode="HTML"); return
+            except: pass
+    else:
+        matn += f"😔 Botda bu kino hali yo'q.\n\n🏷 Nomi: <b>{topilgan[0]}</b>"
+    yuborish(chat_id, matn, parse_mode="HTML")
+
 def dumaloq_video(kirish):
     chiq = f"/tmp/doira_{int(time.time()*1000)}.mp4"
     vf = "crop=min(iw\\,ih):min(iw\\,ih),scale=384:384"
@@ -216,20 +261,62 @@ def dumaloq_video(kirish):
     except Exception as e: log.error(e)
     return None
 
-PLATFORMALAR = ["youtube.com","youtu.be","tiktok.com","instagram.com","pinterest.com","twitter.com","x.com","facebook.com","vk.com","dailymotion.com","vimeo.com","twitch.tv","soundcloud.com","reddit.com","ok.ru","rumble.com"]
+PLATFORMALAR = [
+    "youtube.com","youtu.be","tiktok.com","vm.tiktok.com","vt.tiktok.com",
+    "instagram.com","pinterest.com","pin.it","twitter.com","x.com","t.co",
+    "facebook.com","fb.watch","fb.com","vk.com","vkvideo.ru",
+    "dailymotion.com","dai.ly","vimeo.com","twitch.tv","clips.twitch.tv",
+    "soundcloud.com","reddit.com","redd.it","ok.ru","odnoklassniki.ru",
+    "rumble.com","bilibili.com","bilibili.tv","b23.tv",
+    "likee.video","kwai.com","triller.co","snapchat.com",
+    "linkedin.com","streamable.com","coub.com","odysee.com",
+    "bitchute.com","kick.com","nicovideo.jp","nico.ms",
+    "aparat.com","mixcloud.com","bandcamp.com","ted.com",
+]
 
 def url_mi(t):
     t = t.strip().lower()
     return any(p in t for p in PLATFORMALAR) or (t.startswith("http") and "." in t)
 
 def media_yukla(url, audio=False, max_mb=49):
-    ts   = int(time.time()*1000)
-    tmpl = f"/tmp/ytdl_{ts}.%(ext)s"
-    umumiy = {"outtmpl":tmpl,"quiet":True,"no_warnings":True,"noplaylist":True}
+    ts        = int(time.time()*1000)
+    tmpl      = f"/tmp/ytdl_{ts}.%(ext)s"
+    tiktok_mi = any(x in url.lower() for x in ["tiktok.com","vm.tiktok","vt.tiktok"])
+
+    umumiy = {
+        "outtmpl":      tmpl,
+        "quiet":        True,
+        "no_warnings":  True,
+        "noplaylist":   True,
+        "concurrent_fragment_downloads": 4,
+    }
+
+    if tiktok_mi and not audio:
+        umumiy["extractor_args"] = {
+            "tiktok": {
+                "app_name":    ["musical_ly"],
+                "app_version": ["35.1.3"],
+            }
+        }
+        umumiy["format"] = "download_addr-2/download_addr/play_addr/mp4"
+
     if audio:
-        opts = {**umumiy,"format":"bestaudio/best","postprocessors":[{"key":"FFmpegExtractAudio","preferredcodec":"mp3","preferredquality":"192"}]}
+        opts = {
+            **umumiy,
+            "format": "bestaudio/best",
+            "postprocessors": [{"key":"FFmpegExtractAudio","preferredcodec":"mp3","preferredquality":"192"}],
+        }
     else:
-        opts = {**umumiy,"format":f"best[filesize<{max_mb}M][ext=mp4]/bestvideo[height<=720]+bestaudio/best[height<=720]/best","merge_output_format":"mp4"}
+        if not tiktok_mi:
+            umumiy["format"] = (
+                f"bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
+                f"/bestvideo[height<=720]+bestaudio"
+                f"/best[height<=720][ext=mp4]"
+                f"/best[height<=720]"
+                f"/best"
+            )
+            umumiy["merge_output_format"] = "mp4"
+        opts = {**umumiy}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -327,7 +414,13 @@ def start(msg):
     ok, ul = obuna_tekshir(uid)
     if not ok:
         yuborish(msg.chat.id,"❗ Botdan foydalanish uchun kanallarga obuna bo'ling:", reply_markup=obuna_kb(ul)); return
-    yuborish(msg.chat.id, "🎬 <b>Salom!</b>\n\n🔢 Kino kodini yuboring\n📸 Kino rasmi yuboring — bot topadi!\n📥 Yoki quyidagi tugmalar:", parse_mode="HTML", reply_markup=user_kb())
+    yuborish(msg.chat.id,
+        "🎬 <b>Salom! Kino botga xush kelibsiz!</b>\n\n"
+        "🔢 <b>Kino kodini</b> yuboring → kino keladi\n"
+        "🖼 <b>Rasm</b> yuboring → kino topiladi\n"
+        "🎞 <b>Video klip</b> yuboring → kino topiladi\n\n"
+        "📥 Yoki pastdagi tugmalardan foydalaning 👇",
+        parse_mode="HTML", reply_markup=user_kb())
 
 @bot.message_handler(commands=["myid"])
 def myid(msg):
@@ -369,6 +462,11 @@ def doira_btn(msg):
 def rasm_btn(msg):
     user_holat[msg.from_user.id] = {"rejim":"rasm"}
     yuborish(msg.chat.id,"🖼 <b>Rasm orqali kino topish</b>\n\nKino posteri yoki kadrini yuboring!\n\n❌ Bekor: /start", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: not admin_mi(m.from_user.id) and m.text=="🎞 Video orqali kino topish")
+def video_kino_btn(msg):
+    user_holat[msg.from_user.id] = {"rejim":"kino_video"}
+    yuborish(msg.chat.id,"🎞 <b>Video orqali kino topish</b>\n\nKino yoki serialdan qisqa klip yuboring!\nBot kadrni tahlil qilib kino nomini aniqlaydi 🤖\n\n❌ Bekor: /start", parse_mode="HTML")
 
 @bot.callback_query_handler(func=lambda c: c.data in EFFEKTLAR)
 def effekt_cb(call):
@@ -422,36 +520,14 @@ def foto_handler(msg):
     k = yuborish(msg.chat.id,"🔍 Rasm tahlil qilinmoqda... ⏳")
     try:
         fi  = bot.get_file(msg.photo[-1].file_id)
-        url = f"https://api.telegram.org/file/bot{TOKEN}/{fi.file_path}"
-        ts  = int(time.time()*1000)
-        img = f"/tmp/rasm_{ts}.jpg"
-        urllib.request.urlretrieve(url, img)
+        dl  = f"https://api.telegram.org/file/bot{TOKEN}/{fi.file_path}"
+        img = f"/tmp/rasm_{int(time.time()*1000)}.jpg"
+        urllib.request.urlretrieve(dl, img)
     except:
         try: bot.delete_message(msg.chat.id, k.message_id)
         except: pass
         yuborish(msg.chat.id,"❌ Rasm yuklab bo'lmadi"); return
-    topilgan = rasmdan_aniqla(img)
-    try: os.remove(img)
-    except: pass
-    try: bot.delete_message(msg.chat.id, k.message_id)
-    except: pass
-    if not topilgan:
-        yuborish(msg.chat.id,"❌ Rasmdan kino aniqlanmadi.\n💡 Kino posteri yoki aniq kadr yuboring."); return
-    baza = []
-    for t in topilgan:
-        for r in bazadan_qidirish(t):
-            if r not in baza: baza.append(r)
-    matn = f"🔍 <b>Natija:</b>\n\n🌐 Aniqlangan: <b>{topilgan[0]}</b>\n\n"
-    if baza:
-        matn += "🎬 <b>Botdagi kinolar:</b>\n"
-        for kod,nom,pid,_ in baza[:5]: matn += f"• Kod: <code>{kod}</code> — {nom}\n"
-        matn += "\n📩 Kodni yuboring → kino keladi!"
-        if baza[0][2]:
-            try: bot.send_photo(msg.chat.id, baza[0][2], caption=matn, parse_mode="HTML"); return
-            except: pass
-    else:
-        matn += f"😔 Botda bu kino yo'q.\n💡 Nomi: <b>{topilgan[0]}</b>"
-    yuborish(msg.chat.id, matn, parse_mode="HTML")
+    kino_qidirish_natija(msg.chat.id, img, k.message_id)
 
 @bot.message_handler(func=lambda m: not admin_mi(m.from_user.id), content_types=["text","video","document"])
 def asosiy(msg):
@@ -500,6 +576,47 @@ def asosiy(msg):
                 if item["thumb"]: bot.send_photo(msg.chat.id, item["thumb"], caption=cap, parse_mode="HTML", reply_markup=kb)
                 else: yuborish(msg.chat.id, cap, parse_mode="HTML", reply_markup=kb)
             except: yuborish(msg.chat.id, cap, parse_mode="HTML", reply_markup=kb)
+
+    elif rejim == "kino_video":
+        user_holat.pop(uid,None)
+        vid_fayl = None
+        if msg.video:
+            k = yuborish(msg.chat.id,"⏬ Video yuklanmoqda... ⏳")
+            try:
+                fi = bot.get_file(msg.video.file_id)
+                dl = f"https://api.telegram.org/file/bot{TOKEN}/{fi.file_path}"
+                vid_fayl = f"/tmp/kv_{int(time.time()*1000)}.mp4"
+                urllib.request.urlretrieve(dl, vid_fayl)
+                try: bot.delete_message(msg.chat.id, k.message_id)
+                except: pass
+            except:
+                try: bot.delete_message(msg.chat.id, k.message_id)
+                except: pass
+                yuborish(msg.chat.id,"❌ Video yuklab bo'lmadi"); return
+        elif msg.document and msg.document.mime_type and "video" in msg.document.mime_type:
+            k = yuborish(msg.chat.id,"⏬ Video yuklanmoqda... ⏳")
+            try:
+                fi = bot.get_file(msg.document.file_id)
+                dl = f"https://api.telegram.org/file/bot{TOKEN}/{fi.file_path}"
+                vid_fayl = f"/tmp/kv_{int(time.time()*1000)}.mp4"
+                urllib.request.urlretrieve(dl, vid_fayl)
+                try: bot.delete_message(msg.chat.id, k.message_id)
+                except: pass
+            except:
+                try: bot.delete_message(msg.chat.id, k.message_id)
+                except: pass
+                yuborish(msg.chat.id,"❌ Video yuklab bo'lmadi"); return
+        else:
+            yuborish(msg.chat.id,"❌ Video yuboring (rasm uchun 🖼 tugmasini ishlating)"); return
+        k2 = yuborish(msg.chat.id,"🎞 Kadr aniqlanmoqda... ⏳")
+        kadr = video_kadr_ol(vid_fayl)
+        try: os.remove(vid_fayl)
+        except: pass
+        if not kadr:
+            try: bot.delete_message(msg.chat.id, k2.message_id)
+            except: pass
+            yuborish(msg.chat.id,"❌ Videodan kadr olib bo'lmadi\n💡 Boshqa format sinab ko'ring"); return
+        kino_qidirish_natija(msg.chat.id, kadr, k2.message_id)
 
     elif rejim == "doira":
         user_holat.pop(uid,None)
@@ -568,14 +685,14 @@ def asosiy(msg):
         kanal = kanallar_ol()
         kanal_text = kanal[0] if kanal else ""
         if poster_id:
-            try: bot.send_photo(msg.chat.id, poster_id, caption=f"🎬 <b>{nom}</b>", parse_mode="HTML")
+            try: bot.send_photo(msg.chat.id, poster_id, caption=f"🎬 <b>{nom}</b>", parse_mode="HTML", protect_content=True)
             except: pass
         for qnum, fid in qismlar:
             cap = f"🎬 <b>{nom}</b>" + (f" — {qnum}-qism" if len(qismlar)>1 else "")
             if kanal_text: cap += f"\n\n📢 {kanal_text}"
-            try: bot.send_video(msg.chat.id, fid, caption=cap, parse_mode="HTML")
+            try: bot.send_video(msg.chat.id, fid, caption=cap, parse_mode="HTML", protect_content=True)
             except:
-                try: bot.send_document(msg.chat.id, fid, caption=cap, parse_mode="HTML")
+                try: bot.send_document(msg.chat.id, fid, caption=cap, parse_mode="HTML", protect_content=True)
                 except: yuborish(msg.chat.id,f"❌ {qnum}-qism yuborishda xatolik")
 
 @bot.message_handler(func=lambda m: admin_mi(m.from_user.id) and m.text=="📊 Statistika")
