@@ -1,830 +1,846 @@
-import telebot
-from telebot import types
-import psycopg2
-from psycopg2 import pool
+import os
+import re
+import glob
 import time
 import logging
-import os
-from flask import Flask
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import subprocess
 import urllib.request
+import requests
+import psycopg2
+from psycopg2 import pool
+from flask import Flask
+from concurrent.futures import ThreadPoolExecutor
+import telebot
+from telebot import types
+import yt_dlp
 
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS_ENV = [int(x.strip()) for x in os.getenv("ADMIN_ID", "0").split(",") if x.strip().isdigit()]
-MAIN_ADMIN_ID = ADMIN_IDS_ENV[0] if ADMIN_IDS_ENV else 0
-CHANNEL = os.getenv("CHANNEL", "")
-DATABASE_URL = os.getenv("DATABASE_URL")
+TOKEN        = os.getenv("BOT_TOKEN", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+CHANNEL      = os.getenv("CHANNEL", "")
+_admin_env   = os.getenv("ADMIN_ID", "0")
+ADMIN_IDS    = [int(x.strip()) for x in _admin_env.split(",") if x.strip().isdigit()]
+MAIN_ADMIN   = ADMIN_IDS[0] if ADMIN_IDS else 0
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
 bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=8)
 
-_cache = {}
+_cache: dict = {}
 
-def cache_get(key):
-    entry = _cache.get(key)
-    if entry and time.time() < entry["exp"]:
-        return entry["val"], True
+def kesh_ol(k):
+    e = _cache.get(k)
+    if e and time.time() < e["exp"]:
+        return e["val"], True
     return None, False
 
-def cache_set(key, val, ttl=60):
-    _cache[key] = {"val": val, "exp": time.time() + ttl}
+def kesh_set(k, v, ttl=60):
+    _cache[k] = {"val": v, "exp": time.time() + ttl}
 
-def cache_del(key):
-    _cache.pop(key, None)
+def kesh_del(k):
+    _cache.pop(k, None)
 
 app = Flask(__name__)
 
-@app.route('/')
+@app.route("/")
 def home():
-    return "Bot ishlayapti ✅"
+    return "Bot ishlayapti"
 
-@app.route('/health')
+@app.route("/health")
 def health():
     return "OK"
 
-def run_web():
+def flask_start():
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DATABASE_URL)
 
-def db_execute(query, params=None, fetch=False, fetchone=False):
+def db(sql, params=None, *, fetch=False, one=False):
     conn = db_pool.getconn()
     try:
         with conn.cursor() as cur:
-            cur.execute(query, params or ())
-            if fetchone:
-                result = cur.fetchone()
-            elif fetch:
-                result = cur.fetchall()
-            else:
-                result = None
+            cur.execute(sql, params or ())
+            if one:    result = cur.fetchone()
+            elif fetch: result = cur.fetchall()
+            else:       result = None
             conn.commit()
             return result
-    except Exception as e:
+    except Exception as err:
         conn.rollback()
-        logging.error(f"DB error: {e}")
+        log.error(f"DB: {err}")
         return None
     finally:
         db_pool.putconn(conn)
 
 def init_db():
-    db_execute("""CREATE TABLE IF NOT EXISTS bot_users (
-        id BIGINT PRIMARY KEY, name TEXT,
-        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-    db_execute("""CREATE TABLE IF NOT EXISTS movies (
-        code TEXT PRIMARY KEY, name TEXT,
-        views INTEGER DEFAULT 0,
-        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-    db_execute("""CREATE TABLE IF NOT EXISTS movie_parts (
-        id SERIAL PRIMARY KEY,
-        code TEXT NOT NULL,
-        part_num INTEGER NOT NULL,
-        file_id TEXT NOT NULL,
-        UNIQUE(code, part_num))""")
-    db_execute("""CREATE TABLE IF NOT EXISTS admins (
-        id BIGINT PRIMARY KEY, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-    db_execute("""CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY, value TEXT)""")
-    for aid in ADMIN_IDS_ENV:
-        db_execute("INSERT INTO admins (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (aid,))
+    db("CREATE TABLE IF NOT EXISTS bot_users (id BIGINT PRIMARY KEY, name TEXT, qoshildi TIMESTAMP DEFAULT NOW())")
+    db("CREATE TABLE IF NOT EXISTS kinolar (kod TEXT PRIMARY KEY, nom TEXT, poster_id TEXT, korishlar INTEGER DEFAULT 0, qoshildi TIMESTAMP DEFAULT NOW())")
+    db("ALTER TABLE kinolar ADD COLUMN IF NOT EXISTS poster_id TEXT")
+    db("CREATE TABLE IF NOT EXISTS kino_qismlar (id SERIAL PRIMARY KEY, kod TEXT NOT NULL, qism_num INTEGER NOT NULL, fayl_id TEXT NOT NULL, UNIQUE(kod, qism_num))")
+    db("CREATE TABLE IF NOT EXISTS adminlar (id BIGINT PRIMARY KEY, qoshildi TIMESTAMP DEFAULT NOW())")
+    db("CREATE TABLE IF NOT EXISTS sozlamalar (kalit TEXT PRIMARY KEY, qiymat TEXT)")
+    for aid in ADMIN_IDS:
+        db("INSERT INTO adminlar (id) VALUES (%s) ON CONFLICT DO NOTHING", (aid,))
     if CHANNEL:
-        existing = db_execute("SELECT value FROM settings WHERE key='channels'", fetchone=True)
-        if not existing:
-            db_execute("INSERT INTO settings (key, value) VALUES ('channels', %s) ON CONFLICT (key) DO NOTHING", (CHANNEL,))
-    logging.info("Database tayyor ✅")
+        db("INSERT INTO sozlamalar (kalit, qiymat) VALUES ('kanallar', %s) ON CONFLICT DO NOTHING", (CHANNEL,))
 
-def get_channels():
-    val, hit = cache_get("channels")
-    if hit:
-        return val
-    row = db_execute("SELECT value FROM settings WHERE key = 'channels'", fetchone=True)
-    if row and row[0]:
-        result = [ch.strip() for ch in row[0].split(",") if ch.strip()]
-    else:
-        result = [CHANNEL] if CHANNEL else []
-    cache_set("channels", result, ttl=300)
-    return result
+def kanallar_ol():
+    v, ok = kesh_ol("kanallar")
+    if ok: return v
+    row = db("SELECT qiymat FROM sozlamalar WHERE kalit='kanallar'", one=True)
+    r = [k.strip() for k in row[0].split(",") if k.strip()] if row and row[0] else ([CHANNEL] if CHANNEL else [])
+    kesh_set("kanallar", r, ttl=300)
+    return r
 
-def save_channels(channels):
-    value = ",".join(channels)
-    db_execute("INSERT INTO settings (key, value) VALUES ('channels', %s) ON CONFLICT (key) DO UPDATE SET value=%s",
-               (value, value))
-    cache_del("channels")
+def kanallar_saqlash(lst):
+    v = ",".join(lst)
+    db("INSERT INTO sozlamalar (kalit, qiymat) VALUES ('kanallar',%s) ON CONFLICT (kalit) DO UPDATE SET qiymat=%s", (v, v))
+    kesh_del("kanallar")
 
-admin_states = {}
+def admin_mi(uid):
+    if uid in ADMIN_IDS: return True
+    v, ok = kesh_ol(f"adm_{uid}")
+    if ok: return v
+    r = db("SELECT 1 FROM adminlar WHERE id=%s", (uid,), one=True)
+    kesh_set(f"adm_{uid}", r is not None, ttl=120)
+    return r is not None
 
-def is_admin(user_id):
-    if user_id in ADMIN_IDS_ENV:
-        return True
-    val, hit = cache_get(f"admin_{user_id}")
-    if hit:
-        return val
-    result = db_execute("SELECT 1 FROM admins WHERE id = %s", (user_id,), fetchone=True)
-    is_adm = result is not None
-    cache_set(f"admin_{user_id}", is_adm, ttl=120)
-    return is_adm
+def bosh_admin(uid):
+    return uid == MAIN_ADMIN
 
-def is_main_admin(user_id):
-    return user_id == MAIN_ADMIN_ID
-
-def check_sub(user_id):
-    channels = get_channels()
-    if not channels:
-        return True, []
-    val, hit = cache_get(f"sub_{user_id}")
-    if hit:
-        return val
-    not_subbed = []
-    for ch in channels:
+def obuna_tekshir(uid):
+    kanallar = kanallar_ol()
+    if not kanallar: return True, []
+    v, ok = kesh_ol(f"sub_{uid}")
+    if ok: return v
+    ulanmagan = []
+    for k in kanallar:
         try:
-            status = bot.get_chat_member(ch, user_id).status
-            if status not in ["member", "administrator", "creator"]:
-                not_subbed.append(ch)
-        except Exception as e:
-            logging.error(f"Sub check error {ch}: {e}")
-    result = (len(not_subbed) == 0, not_subbed)
-    cache_set(f"sub_{user_id}", result, ttl=60)
-    return result
+            if bot.get_chat_member(k, uid).status not in ("member","administrator","creator"):
+                ulanmagan.append(k)
+        except: pass
+    r = (len(ulanmagan) == 0, ulanmagan)
+    kesh_set(f"sub_{uid}", r, ttl=60)
+    return r
 
-def safe_send(chat_id, text, **kwargs):
-    try:
-        return bot.send_message(chat_id, text, **kwargs)
-    except Exception as e:
-        logging.error(f"Send error: {e}")
+def yuborish(chat_id, matn, **kw):
+    try: return bot.send_message(chat_id, matn, **kw)
+    except Exception as e: log.error(f"Send: {e}")
 
-def sub_keyboard(not_subbed):
-    kb = types.InlineKeyboardMarkup()
-    for ch in not_subbed:
-        name = ch.replace("@", "")
-        kb.add(types.InlineKeyboardButton(f"📢 {ch} ga obuna", url=f"https://t.me/{name}"))
-    kb.add(types.InlineKeyboardButton("✅ Tekshirish", callback_data="check_sub"))
+def user_kb():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add("📥 Video yuklab olish", "🎵 Musiqa yuklab olish")
+    kb.add("🔍 Musiqa qidirish",    "🔵 Dumaloq video")
+    kb.add("🖼 Rasm orqali kino topish")
     return kb
 
-def admin_keyboard(user_id=None):
+def admin_kb(uid=None):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("➕ Kino qo'shish", "🗑 Kino o'chirish")
-    kb.add("📊 Statistika", "📋 Kinolar ro'yxati")
-    kb.add("👥 Userlar", "📨 Reklama yuborish")
-    kb.add("👑 Adminlar", "⚙️ Sozlamalar")
-    if user_id and is_main_admin(user_id):
+    kb.add("➕ Kino qo'shish",   "🗑 Kino o'chirish")
+    kb.add("📊 Statistika",       "📋 Kinolar ro'yxati")
+    kb.add("👥 Foydalanuvchilar", "📨 Reklama yuborish")
+    kb.add("👑 Adminlar",         "⚙️ Sozlamalar")
+    if uid and bosh_admin(uid):
         kb.add("➕ Admin qo'shish", "❌ Admin o'chirish")
     return kb
 
-def show_admins_panel(chat_id, is_main):
-    admins = db_execute("SELECT id FROM admins ORDER BY added_at", fetch=True) or []
-    text = "👑 <b>Adminlar ro'yxati:</b>\n\n"
+def obuna_kb(lst):
     kb = types.InlineKeyboardMarkup()
-    for row in admins:
-        aid = row[0]
-        marker = " 👑 (asosiy)" if aid == MAIN_ADMIN_ID else ""
-        text += f"• <code>{aid}</code>{marker}\n"
-        if is_main and aid != MAIN_ADMIN_ID:
-            kb.add(types.InlineKeyboardButton(f"❌ {aid} ni o'chirish", callback_data=f"remove_admin_{aid}"))
-    if is_main:
-        kb.add(types.InlineKeyboardButton("➕ Yangi admin qo'shish", callback_data="add_admin_start"))
-    safe_send(chat_id, text, parse_mode="HTML", reply_markup=kb)
-
-@bot.message_handler(commands=['addadmin'])
-def add_admin_cmd(msg):
-    if not is_main_admin(msg.from_user.id):
-        safe_send(msg.chat.id, "❌ Faqat asosiy admin")
-        return
-    try:
-        new_admin_id = int(msg.text.split()[1])
-        db_execute("INSERT INTO admins (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (new_admin_id,))
-        cache_del(f"admin_{new_admin_id}")
-        safe_send(msg.chat.id, f"✅ Admin qo'shildi: <code>{new_admin_id}</code>", parse_mode="HTML")
-        try:
-            safe_send(new_admin_id, "🎉 Siz admin bo'ldingiz! /start bosing.")
-        except:
-            pass
-    except (IndexError, ValueError):
-        safe_send(msg.chat.id, "❗ Format: <code>/addadmin USER_ID</code>", parse_mode="HTML")
-
-@bot.message_handler(commands=['removeadmin'])
-def remove_admin_cmd(msg):
-    if not is_main_admin(msg.from_user.id):
-        safe_send(msg.chat.id, "❌ Faqat asosiy admin")
-        return
-    try:
-        rm_id = int(msg.text.split()[1])
-        if rm_id == MAIN_ADMIN_ID:
-            safe_send(msg.chat.id, "❌ Asosiy adminni o'chirib bo'lmaydi")
-            return
-        result = db_execute("DELETE FROM admins WHERE id = %s RETURNING id", (rm_id,), fetchone=True)
-        if result:
-            cache_del(f"admin_{rm_id}")
-            safe_send(msg.chat.id, f"✅ Admin o'chirildi: <code>{rm_id}</code>", parse_mode="HTML")
-        else:
-            safe_send(msg.chat.id, "❌ Bunday admin topilmadi")
-    except (IndexError, ValueError):
-        safe_send(msg.chat.id, "❗ Format: <code>/removeadmin USER_ID</code>", parse_mode="HTML")
-
-@bot.message_handler(commands=['admins'])
-def list_admins_cmd(msg):
-    if not is_main_admin(msg.from_user.id):
-        return
-    admins = db_execute("SELECT id FROM admins ORDER BY added_at", fetch=True) or []
-    text = "👑 <b>Adminlar:</b>\n\n"
-    for (aid,) in admins:
-        marker = " 👑" if aid == MAIN_ADMIN_ID else ""
-        text += f"• <code>{aid}</code>{marker}\n"
-    safe_send(msg.chat.id, text or "📭 Admin yo'q", parse_mode="HTML")
-
-@bot.message_handler(commands=['myid'])
-def my_id_cmd(msg):
-    safe_send(msg.chat.id, f"🆔 Sizning ID: <code>{msg.from_user.id}</code>", parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: is_admin(m.from_user.id) and m.text == "👑 Adminlar")
-def admins_menu(msg):
-    show_admins_panel(msg.chat.id, is_main_admin(msg.from_user.id))
-
-@bot.message_handler(func=lambda m: is_main_admin(m.from_user.id) and m.text == "➕ Admin qo'shish")
-def add_admin_btn(msg):
-    admin_states[msg.from_user.id] = {"step": "add_admin_id"}
-    safe_send(msg.chat.id,
-        "➕ Yangi admin ID sini yuboring:\n\n"
-        "💡 Admin <code>/myid</code> yozib ID sini bilsin\n\n"
-        "❌ Bekor: /start", parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: is_main_admin(m.from_user.id) and m.text == "❌ Admin o'chirish")
-def remove_admin_btn(msg):
-    admins = db_execute("SELECT id FROM admins ORDER BY added_at", fetch=True) or []
-    kb = types.InlineKeyboardMarkup()
-    found = False
-    for row in admins:
-        aid = row[0]
-        if aid != MAIN_ADMIN_ID:
-            kb.add(types.InlineKeyboardButton(f"❌ {aid} ni o'chirish", callback_data=f"remove_admin_{aid}"))
-            found = True
-    if not found:
-        safe_send(msg.chat.id, "📭 O'chiriladigan admin yo'q")
-        return
-    safe_send(msg.chat.id, "👑 Qaysi adminni o'chirmoqchisiz?", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("remove_admin_"))
-def remove_admin_callback(call):
-    if not is_main_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "❌ Faqat asosiy admin", show_alert=True)
-        return
-    target_id = int(call.data.split("_")[-1])
-    if target_id == MAIN_ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ Asosiy adminni o'chirib bo'lmaydi!", show_alert=True)
-        return
-    result = db_execute("DELETE FROM admins WHERE id = %s RETURNING id", (target_id,), fetchone=True)
-    if result:
-        cache_del(f"admin_{target_id}")
-        bot.answer_callback_query(call.id, f"✅ O'chirildi: {target_id}", show_alert=True)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        show_admins_panel(call.message.chat.id, True)
-    else:
-        bot.answer_callback_query(call.id, "❌ Topilmadi", show_alert=True)
-
-@bot.callback_query_handler(func=lambda c: c.data == "add_admin_start")
-def add_admin_start_callback(call):
-    if not is_main_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "❌ Faqat asosiy admin", show_alert=True)
-        return
-    admin_states[call.from_user.id] = {"step": "add_admin_id"}
-    bot.answer_callback_query(call.id)
-    safe_send(call.message.chat.id,
-        "➕ Yangi admin ID sini yuboring:\n\n"
-        "💡 Admin <code>/myid</code> yozib ID sini bilsin\n\n"
-        "❌ Bekor: /start", parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: is_admin(m.from_user.id) and m.text == "⚙️ Sozlamalar")
-def settings_menu(msg):
-    channels = get_channels()
-    if channels:
-        ch_text = "\n".join([f"  {i+1}. <b>{ch}</b>" for i, ch in enumerate(channels)])
-        text = f"⚙️ <b>Sozlamalar</b>\n\n📢 Kanallar ({len(channels)}/5):\n{ch_text}"
-    else:
-        text = "⚙️ <b>Sozlamalar</b>\n\n📢 Kanallar: <b>Ulanmagan</b>"
-    kb = types.InlineKeyboardMarkup()
-    if len(channels) < 5:
-        kb.add(types.InlineKeyboardButton("➕ Kanal/Guruh qo'shish", callback_data="kanal_add"))
-    for i, ch in enumerate(channels):
-        kb.add(types.InlineKeyboardButton(f"❌ {ch} ni o'chirish", callback_data=f"kanal_del_{i}"))
-    safe_send(msg.chat.id, text, parse_mode="HTML", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda c: c.data == "kanal_add")
-def kanal_add_callback(call):
-    if not is_admin(call.from_user.id):
-        return
-    channels = get_channels()
-    if len(channels) >= 5:
-        bot.answer_callback_query(call.id, "❌ Maksimum 5 ta kanal!", show_alert=True)
-        return
-    admin_states[call.from_user.id] = {"step": "kanal_set"}
-    bot.answer_callback_query(call.id)
-    safe_send(call.message.chat.id,
-        "📢 Kanal yoki guruh username ni yuboring:\n\n"
-        "Misol: <code>@mening_kanalim</code>\n\n"
-        "❌ Bekor: /start", parse_mode="HTML")
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("kanal_del_"))
-def kanal_del_callback(call):
-    if not is_admin(call.from_user.id):
-        return
-    idx = int(call.data.split("_")[-1])
-    channels = get_channels()
-    if idx < len(channels):
-        removed = channels.pop(idx)
-        save_channels(channels)
-        bot.answer_callback_query(call.id, f"✅ {removed} o'chirildi!", show_alert=True)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        settings_menu_by_id(call.message.chat.id)
-    else:
-        bot.answer_callback_query(call.id, "❌ Topilmadi", show_alert=True)
-
-def settings_menu_by_id(chat_id):
-    channels = get_channels()
-    if channels:
-        ch_text = "\n".join([f"  {i+1}. <b>{ch}</b>" for i, ch in enumerate(channels)])
-        text = f"⚙️ <b>Sozlamalar</b>\n\n📢 Kanallar ({len(channels)}/5):\n{ch_text}"
-    else:
-        text = "⚙️ <b>Sozlamalar</b>\n\n📢 Kanallar: <b>Ulanmagan</b>"
-    kb = types.InlineKeyboardMarkup()
-    if len(channels) < 5:
-        kb.add(types.InlineKeyboardButton("➕ Kanal/Guruh qo'shish", callback_data="kanal_add"))
-    for i, ch in enumerate(channels):
-        kb.add(types.InlineKeyboardButton(f"❌ {ch} ni o'chirish", callback_data=f"kanal_del_{i}"))
-    safe_send(chat_id, text, parse_mode="HTML", reply_markup=kb)
-
-@bot.message_handler(commands=['start'])
-def start(msg):
-    user = msg.from_user
-    db_execute("INSERT INTO bot_users (id, name) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING",
-               (user.id, user.first_name))
-    if is_admin(user.id):
-        safe_send(msg.chat.id, "👑 Salom, Admin!", reply_markup=admin_keyboard(user.id))
-        return
-    is_subbed, not_subbed = check_sub(user.id)
-    if not is_subbed:
-        safe_send(msg.chat.id,
-            "❗ Botdan foydalanish uchun quyidagi kanal(lar)ga obuna bo'ling:",
-            reply_markup=sub_keyboard(not_subbed))
-        return
-    safe_send(msg.chat.id, "🎬 Salom! Kino kodini yuboring:")
-    try:
-        safe_send(MAIN_ADMIN_ID, f"👤 Yangi user: {user.id} | {user.first_name}")
-    except:
-        pass
-
-@bot.callback_query_handler(func=lambda c: c.data == "check_sub")
-def check_callback(call):
-    cache_del(f"sub_{call.from_user.id}")
-    is_subbed, not_subbed = check_sub(call.from_user.id)
-    if is_subbed:
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        safe_send(call.message.chat.id, "✅ Rahmat! Kino kodini yuboring:")
-    else:
-        bot.answer_callback_query(call.id, "❗ Hali barcha kanallarga obuna bo'lmagansiz!", show_alert=True)
-
-@bot.message_handler(func=lambda m: is_admin(m.from_user.id) and m.text == "➕ Kino qo'shish")
-def add_movie_start(msg):
-    admin_states[msg.from_user.id] = {"step": "code", "data": {}}
-    safe_send(msg.chat.id, "🔢 Kino kodini yuboring:\n\nMisol: <code>101</code> yoki <code>serial1</code>", parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: is_admin(m.from_user.id) and m.text == "🗑 Kino o'chirish")
-def delete_movie_start(msg):
-    admin_states[msg.from_user.id] = {"step": "delete", "data": {}}
-    safe_send(msg.chat.id, "🗑 O'chiriladigan kino kodini yuboring:")
-
-@bot.message_handler(func=lambda m: is_admin(m.from_user.id) and m.text == "📊 Statistika")
-def stats(msg):
-    users_count = db_execute("SELECT COUNT(*) FROM bot_users", fetchone=True)[0]
-    movies_count = db_execute("SELECT COUNT(*) FROM movies", fetchone=True)[0]
-    parts_count = db_execute("SELECT COUNT(*) FROM movie_parts", fetchone=True)[0]
-    total_views = db_execute("SELECT COALESCE(SUM(views), 0) FROM movies", fetchone=True)[0]
-    text = (f"📊 <b>Statistika</b>\n\n"
-            f"👥 Foydalanuvchilar: <b>{users_count}</b>\n"
-            f"🎬 Kinolar/Seriallar: <b>{movies_count}</b>\n"
-            f"🎞 Jami qismlar: <b>{parts_count}</b>\n"
-            f"👁 Jami ko'rishlar: <b>{total_views}</b>")
-    safe_send(msg.chat.id, text, parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: is_admin(m.from_user.id) and m.text == "📋 Kinolar ro'yxati")
-def movie_list(msg):
-    movies = db_execute("""
-        SELECT m.code, m.name, m.views,
-               (SELECT COUNT(*) FROM movie_parts WHERE code = m.code) as parts
-        FROM movies m ORDER BY m.added_at DESC LIMIT 50""", fetch=True)
-    if not movies:
-        safe_send(msg.chat.id, "📭 Hech qanday kino yo'q")
-        return
-    text = "📋 <b>Kinolar:</b>\n\n"
-    for code, name, views, parts in movies:
-        parts_info = f" | 🎞 {parts} qism" if parts > 1 else ""
-        text += f"🔢 <code>{code}</code> — {name} (👁 {views}{parts_info})\n"
-    safe_send(msg.chat.id, text, parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: is_admin(m.from_user.id) and m.text == "👥 Userlar")
-def users_menu(msg):
-    total = db_execute("SELECT COUNT(*) FROM bot_users", fetchone=True)[0]
-    today = db_execute("SELECT COUNT(*) FROM bot_users WHERE joined_at >= NOW() - INTERVAL '24 hours'", fetchone=True)[0]
-    week = db_execute("SELECT COUNT(*) FROM bot_users WHERE joined_at >= NOW() - INTERVAL '7 days'", fetchone=True)[0]
-    text = (f"👥 <b>Foydalanuvchilar</b>\n\n"
-            f"📊 Jami: <b>{total}</b>\n"
-            f"📅 Bugun: <b>{today}</b>\n"
-            f"🗓 Hafta: <b>{week}</b>")
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(types.InlineKeyboardButton("📋 Ro'yxat (oxirgi 20)", callback_data="users_list_0"),
-           types.InlineKeyboardButton("🆕 Yangi userlar", callback_data="users_recent"))
-    kb.add(types.InlineKeyboardButton("🔍 User qidirish", callback_data="users_search"))
-    safe_send(msg.chat.id, text, parse_mode="HTML", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("users_list_"))
-def users_list_callback(call):
-    if not is_admin(call.from_user.id):
-        return
-    offset = int(call.data.split("_")[-1])
-    limit = 20
-    users = db_execute("SELECT id, name, joined_at FROM bot_users ORDER BY joined_at DESC LIMIT %s OFFSET %s",
-                       (limit, offset), fetch=True) or []
-    total = db_execute("SELECT COUNT(*) FROM bot_users", fetchone=True)[0]
-    if not users:
-        bot.answer_callback_query(call.id, "📭 Boshqa userlar yo'q")
-        return
-    text = f"👥 <b>Userlar</b> ({offset+1}–{offset+len(users)} / {total})\n\n"
-    for uid, name, joined in users:
-        name_safe = (name or "—").replace("<", "&lt;").replace(">", "&gt;")
-        date_str = joined.strftime("%d.%m.%Y %H:%M") if joined else "—"
-        text += f"🆔 <code>{uid}</code> — {name_safe}\n📅 {date_str}\n\n"
-    kb = types.InlineKeyboardMarkup()
-    nav = []
-    if offset > 0:
-        nav.append(types.InlineKeyboardButton("⬅️ Oldingi", callback_data=f"users_list_{max(0,offset-limit)}"))
-    if offset + limit < total:
-        nav.append(types.InlineKeyboardButton("Keyingi ➡️", callback_data=f"users_list_{offset+limit}"))
-    if nav:
-        kb.row(*nav)
-    kb.add(types.InlineKeyboardButton("🔙 Orqaga", callback_data="users_back"))
-    try:
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb)
-    except:
-        safe_send(call.message.chat.id, text, parse_mode="HTML", reply_markup=kb)
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda c: c.data == "users_recent")
-def users_recent_callback(call):
-    if not is_admin(call.from_user.id):
-        return
-    users = db_execute(
-        "SELECT id, name, joined_at FROM bot_users WHERE joined_at >= NOW() - INTERVAL '24 hours' ORDER BY joined_at DESC LIMIT 30",
-        fetch=True) or []
-    if not users:
-        bot.answer_callback_query(call.id, "📭 Bugun yangi user yo'q", show_alert=True)
-        return
-    text = f"🆕 <b>Bugungi yangi userlar ({len(users)} ta)</b>\n\n"
-    for uid, name, joined in users:
-        name_safe = (name or "—").replace("<", "&lt;").replace(">", "&gt;")
-        date_str = joined.strftime("%H:%M") if joined else "—"
-        text += f"🆔 <code>{uid}</code> — {name_safe} ({date_str})\n"
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("🔙 Orqaga", callback_data="users_back"))
-    try:
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb)
-    except:
-        safe_send(call.message.chat.id, text, parse_mode="HTML", reply_markup=kb)
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda c: c.data == "users_search")
-def users_search_callback(call):
-    if not is_admin(call.from_user.id):
-        return
-    admin_states[call.from_user.id] = {"step": "search_user", "data": {}}
-    safe_send(call.message.chat.id, "🔍 User ID sini yuboring:")
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda c: c.data == "users_back")
-def users_back_callback(call):
-    if not is_admin(call.from_user.id):
-        return
-    total = db_execute("SELECT COUNT(*) FROM bot_users", fetchone=True)[0]
-    today = db_execute("SELECT COUNT(*) FROM bot_users WHERE joined_at >= NOW() - INTERVAL '24 hours'", fetchone=True)[0]
-    week = db_execute("SELECT COUNT(*) FROM bot_users WHERE joined_at >= NOW() - INTERVAL '7 days'", fetchone=True)[0]
-    text = (f"👥 <b>Foydalanuvchilar</b>\n\n"
-            f"📊 Jami: <b>{total}</b>\n"
-            f"📅 Bugun: <b>{today}</b>\n"
-            f"🗓 Hafta: <b>{week}</b>")
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(types.InlineKeyboardButton("📋 Ro'yxat (oxirgi 20)", callback_data="users_list_0"),
-           types.InlineKeyboardButton("🆕 Yangi userlar", callback_data="users_recent"))
-    kb.add(types.InlineKeyboardButton("🔍 User qidirish", callback_data="users_search"))
-    try:
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb)
-    except:
-        safe_send(call.message.chat.id, text, parse_mode="HTML", reply_markup=kb)
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("msg_user_"))
-def msg_user_callback(call):
-    if not is_admin(call.from_user.id):
-        return
-    target_id = int(call.data.split("_")[-1])
-    admin_states[call.from_user.id] = {"step": "send_to_user", "data": {"target_id": target_id}}
-    safe_send(call.message.chat.id, f"✉️ User <code>{target_id}</code> ga xabar yuboring:", parse_mode="HTML")
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("make_admin_"))
-def make_admin_callback(call):
-    if not is_main_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "❌ Faqat asosiy admin", show_alert=True)
-        return
-    target_id = int(call.data.split("_")[-1])
-    db_execute("INSERT INTO admins (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (target_id,))
-    cache_del(f"admin_{target_id}")
-    bot.answer_callback_query(call.id, "✅ Admin qilindi!", show_alert=True)
-    try:
-        safe_send(target_id, "🎉 Siz admin bo'ldingiz! /start bosing.")
-    except:
-        pass
-
-@bot.message_handler(func=lambda m: is_admin(m.from_user.id) and m.text == "📨 Reklama yuborish")
-def broadcast_start(msg):
-    admin_states[msg.from_user.id] = {"step": "broadcast", "data": {}}
-    safe_send(msg.chat.id, "📨 Yubormoqchi bo'lgan xabaringizni yuboring:")
-
-def send_to_user(uid, msg):
-    try:
-        bot.copy_message(uid, msg.chat.id, msg.message_id)
-        return True
-    except Exception as e:
-        if "blocked" in str(e).lower() or "deactivated" in str(e).lower():
-            db_execute("DELETE FROM bot_users WHERE id = %s", (uid,))
-        return False
-
-def add_part_keyboard(code):
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("➕ Yana qism qo'shish", callback_data=f"addpart_{code}"))
-    kb.add(types.InlineKeyboardButton("✅ Tayyor", callback_data="addpart_done"))
+    for k in lst:
+        kb.add(types.InlineKeyboardButton(f"📢 {k} ga obuna bo'lish", url=f"https://t.me/{k.lstrip('@')}"))
+    kb.add(types.InlineKeyboardButton("✅ Obuna bo'ldim, tekshir", callback_data="obuna_tekshir"))
     return kb
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("addpart_") and c.data != "addpart_done")
-def addpart_callback(call):
-    if not is_admin(call.from_user.id):
-        return
-    code = call.data[len("addpart_"):]
-    parts_count = db_execute("SELECT COUNT(*) FROM movie_parts WHERE code=%s", (code,), fetchone=True)[0]
-    admin_states[call.from_user.id] = {"step": "add_part", "data": {"code": code, "part_num": parts_count + 1}}
-    bot.answer_callback_query(call.id)
-    safe_send(call.message.chat.id,
-        f"🎥 <b>{parts_count + 1}-qism</b> videosini yuboring:", parse_mode="HTML")
+def effektlar_kb():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    btns = [types.InlineKeyboardButton(n, callback_data=k) for k,(n,_) in EFFEKTLAR.items()]
+    for i in range(0, len(btns), 2): kb.row(*btns[i:i+2])
+    return kb
 
-@bot.callback_query_handler(func=lambda c: c.data == "addpart_done")
-def addpart_done_callback(call):
-    if not is_admin(call.from_user.id):
-        return
-    bot.answer_callback_query(call.id, "✅ Kino saqlandi!")
+def qism_kb(kod):
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("➕ Yana qism qo'shish", callback_data=f"qism_{kod}"))
+    kb.add(types.InlineKeyboardButton("✅ Tayyor, saqlash",    callback_data="qism_tayyor"))
+    return kb
+
+def soz_kb():
+    kanallar = kanallar_ol()
+    matn = "⚙️ <b>Sozlamalar</b>\n\n"
+    matn += f"📢 Kanallar ({len(kanallar)}/5):\n" if kanallar else "📢 Kanal ulanmagan\n"
+    for i,k in enumerate(kanallar,1): matn += f"  {i}. <b>{k}</b>\n"
+    kb = types.InlineKeyboardMarkup()
+    if len(kanallar) < 5:
+        kb.add(types.InlineKeyboardButton("➕ Kanal/Guruh qo'shish", callback_data="kanal_qosh"))
+    for i,k in enumerate(kanallar):
+        kb.add(types.InlineKeyboardButton(f"❌ {k} ni o'chirish", callback_data=f"kanal_del_{i}"))
+    return matn, kb
+
+def adminlar_paneli(chat_id, bosh):
+    lst  = db("SELECT id FROM adminlar ORDER BY qoshildi", fetch=True) or []
+    matn = "👑 <b>Adminlar:</b>\n\n"
+    kb   = types.InlineKeyboardMarkup()
+    for (aid,) in lst:
+        matn += f"• <code>{aid}</code>{' 👑 (asosiy)' if aid==MAIN_ADMIN else ''}\n"
+        if bosh and aid != MAIN_ADMIN:
+            kb.add(types.InlineKeyboardButton(f"❌ {aid}", callback_data=f"admin_del_{aid}"))
+    if bosh:
+        kb.add(types.InlineKeyboardButton("➕ Admin qo'shish", callback_data="admin_qosh"))
+    yuborish(chat_id, matn, parse_mode="HTML", reply_markup=kb)
+
+EFFEKTLAR = {
+    "eff_bass":      ("🔊 Bass Boost",     "bass=g=10"),
+    "eff_treble":    ("🎵 Treble Boost",   "treble=g=8"),
+    "eff_echo":      ("🌊 Echo",           "aecho=0.8:0.88:60:0.4"),
+    "eff_slrev":     ("🌙 Slowed+Reverb",  "atempo=0.85,aecho=0.8:0.9:1000:0.3"),
+    "eff_speed":     ("⚡ Tezlashtirish",  "atempo=1.5"),
+    "eff_slow":      ("🐌 Sekinlashtirish","atempo=0.75"),
+    "eff_nightcore": ("🎤 Nightcore",      "aresample=48000,asetrate=60000,atempo=0.8"),
+    "eff_volume":    ("📢 Volume+",        "volume=2"),
+}
+
+def effekt_qollan(kirish, filtr):
+    chiq = f"/tmp/eff_{int(time.time()*1000)}.mp3"
     try:
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        r = subprocess.run(["ffmpeg","-y","-i",kirish,"-af",filtr,"-codec:a","libmp3lame","-q:a","3",chiq], capture_output=True, timeout=120)
+        if os.path.exists(chiq) and os.path.getsize(chiq) > 0: return chiq
+    except Exception as e: log.error(e)
+    return None
+
+def dumaloq_video(kirish):
+    chiq = f"/tmp/doira_{int(time.time()*1000)}.mp4"
+    vf = "crop=min(iw\\,ih):min(iw\\,ih),scale=384:384"
+    try:
+        r = subprocess.run(["ffmpeg","-y","-i",kirish,"-vf",vf,"-c:v","libx264","-preset","veryfast","-crf","28","-c:a","aac","-b:a","96k","-t","60","-movflags","+faststart","-pix_fmt","yuv420p",chiq], capture_output=True, timeout=180)
+        if os.path.exists(chiq) and os.path.getsize(chiq) > 0: return chiq
+    except Exception as e: log.error(e)
+    return None
+
+PLATFORMALAR = ["youtube.com","youtu.be","tiktok.com","instagram.com","pinterest.com","twitter.com","x.com","facebook.com","vk.com","dailymotion.com","vimeo.com","twitch.tv","soundcloud.com","reddit.com","ok.ru","rumble.com"]
+
+def url_mi(t):
+    t = t.strip().lower()
+    return any(p in t for p in PLATFORMALAR) or (t.startswith("http") and "." in t)
+
+def media_yukla(url, audio=False, max_mb=49):
+    ts   = int(time.time()*1000)
+    tmpl = f"/tmp/ytdl_{ts}.%(ext)s"
+    umumiy = {"outtmpl":tmpl,"quiet":True,"no_warnings":True,"noplaylist":True}
+    if audio:
+        opts = {**umumiy,"format":"bestaudio/best","postprocessors":[{"key":"FFmpegExtractAudio","preferredcodec":"mp3","preferredquality":"192"}]}
+    else:
+        opts = {**umumiy,"format":f"best[filesize<{max_mb}M][ext=mp4]/bestvideo[height<=720]+bestaudio/best[height<=720]/best","merge_output_format":"mp4"}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            nom, thumb, dur, muallif = info.get("title","Video"), info.get("thumbnail",""), info.get("duration",0), info.get("uploader","")
+        fls = glob.glob(f"/tmp/ytdl_{ts}*")
+        if not fls: return None, nom, thumb, dur, muallif, "topilmadi"
+        f = fls[0]
+        if os.path.getsize(f)/1024/1024 > max_mb:
+            [os.remove(x) for x in fls]
+            return None, nom, thumb, dur, muallif, "hajm"
+        return f, nom, thumb, dur, muallif, None
+    except Exception as e:
+        m = str(e).lower()
+        xato = "yopiq" if "private" in m else "yosh" if "age" in m else "mavjud_emas" if "unavailab" in m else str(e)[:100]
+        return None, None, None, 0, None, xato
+
+def musiqa_qidirish(sorov, n=4):
+    opts = {"quiet":True,"no_warnings":True,"extract_flat":True,"noplaylist":True}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            res = ydl.extract_info(f"ytsearch{n}:{sorov}", download=False)
+            lst = []
+            for e in res.get("entries",[]):
+                if not e: continue
+                dur = e.get("duration",0) or 0
+                m,s = divmod(int(dur),60)
+                lst.append({"nom":e.get("title","Nomsiz"),"url":f"https://youtube.com/watch?v={e.get('id','')}","davomiy":f"{m}:{s:02d}","thumb":e.get("thumbnail",""),"id":e.get("id",""),"muallif":e.get("uploader","")})
+            return lst
+    except: return []
+
+def rasmdan_aniqla(fayl):
+    try:
+        h = {"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36","Accept-Language":"ru-RU,ru;q=0.9,en;q=0.8"}
+        with open(fayl,"rb") as f:
+            r = requests.post("https://lens.google.com/upload?ep=gsbubb&hl=ru&re=df", files={"encoded_image":("photo.jpg",f,"image/jpeg")}, headers=h, allow_redirects=True, timeout=20)
+        t = r.text
+        topilgan = []
+        for pat in [r'"knowledgeGraphEntities"[^}]*?"title"\s*:\s*"([^"]{2,80})"',r'"title"\s*:\s*"([^"]{3,80})"',r'"text"\s*:\s*"([A-Za-z0-9\u0400-\u04FF\s\-\:\'\"\!]{4,60})"']:
+            for m in re.findall(pat, t):
+                m = m.strip()
+                tashla = ["Google","Search","Images","Lens","http","www","com","null","true","false"]
+                if m and len(m)>3 and m not in topilgan and not any(x.lower() in m.lower() for x in tashla):
+                    topilgan.append(m)
+        return topilgan[:8]
+    except Exception as e:
+        log.error(e); return []
+
+def bazadan_qidirish(sorov):
+    return db("SELECT kod,nom,poster_id,korishlar FROM kinolar WHERE LOWER(nom) LIKE %s ORDER BY korishlar DESC LIMIT 5", (f"%{sorov.lower()}%",), fetch=True) or []
+
+def davomiylik(s):
+    if not s: return ""
+    m,s = divmod(int(s),60); h,m = divmod(m,60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+def yuklab_xato(chat_id, xato):
+    xabarlar = {"hajm":"❌ Video 49 MB dan katta","yopiq":"❌ Bu video yopiq (private)","yosh":"❌ Yosh chekloviga ega","mavjud_emas":"❌ Video mavjud emas"}
+    yuborish(chat_id, xabarlar.get(xato, f"❌ Yuklab bo'lmadi: {xato[:100]}" if xato else "❌ Yuklab bo'lmadi"))
+
+def video_yuborish(chat_id, fayl, nom, dur, muallif):
+    cap = f"🎬 <b>{nom}</b>"
+    if muallif: cap += f"\n👤 {muallif}"
+    d = davomiylik(dur)
+    if d: cap += f"\n⏱ {d}"
+    try:
+        with open(fayl,"rb") as f: bot.send_video(chat_id, f, caption=cap, parse_mode="HTML", supports_streaming=True)
     except:
-        pass
-
-@bot.message_handler(func=lambda m: is_admin(m.from_user.id) and m.from_user.id in admin_states,
-                     content_types=['text', 'video', 'document'])
-def admin_steps(msg):
-    state = admin_states[msg.from_user.id]
-    step = state["step"]
-
-    if step == "code":
-        code = msg.text.strip()
-        state["data"]["code"] = code
-        state["step"] = "name"
-        safe_send(msg.chat.id, "📝 Kino/Serial nomini yuboring:")
-
-    elif step == "name":
-        state["data"]["name"] = msg.text.strip()
-        state["step"] = "file"
-        safe_send(msg.chat.id, "🎥 <b>1-qism</b> videosini yuboring:", parse_mode="HTML")
-
-    elif step == "file":
-        file_id = None
-        if msg.video:
-            file_id = msg.video.file_id
-        elif msg.document:
-            file_id = msg.document.file_id
-        if not file_id:
-            safe_send(msg.chat.id, "❗ Video yuboring")
-            return
-        code = state["data"]["code"]
-        name = state["data"]["name"]
-        db_execute("INSERT INTO movies (code, name) VALUES (%s, %s) ON CONFLICT (code) DO UPDATE SET name=%s",
-                   (code, name, name))
-        db_execute("INSERT INTO movie_parts (code, part_num, file_id) VALUES (%s, 1, %s) ON CONFLICT (code, part_num) DO UPDATE SET file_id=%s",
-                   (code, file_id, file_id))
-        del admin_states[msg.from_user.id]
-        safe_send(msg.chat.id,
-            f"✅ <b>{name}</b> qo'shildi!\n🔢 Kod: <code>{code}</code>\n\nYana qism qo'shishni xohlaysizmi?",
-            parse_mode="HTML", reply_markup=add_part_keyboard(code))
-
-    elif step == "add_part":
-        file_id = None
-        if msg.video:
-            file_id = msg.video.file_id
-        elif msg.document:
-            file_id = msg.document.file_id
-        if not file_id:
-            safe_send(msg.chat.id, "❗ Video yuboring")
-            return
-        code = state["data"]["code"]
-        part_num = state["data"]["part_num"]
-        db_execute("INSERT INTO movie_parts (code, part_num, file_id) VALUES (%s, %s, %s) ON CONFLICT (code, part_num) DO UPDATE SET file_id=%s",
-                   (code, part_num, file_id, file_id))
-        del admin_states[msg.from_user.id]
-        total_parts = db_execute("SELECT COUNT(*) FROM movie_parts WHERE code=%s", (code,), fetchone=True)[0]
-        safe_send(msg.chat.id,
-            f"✅ <b>{part_num}-qism</b> qo'shildi! Jami: {total_parts} qism\n\nYana qism qo'shishni xohlaysizmi?",
-            parse_mode="HTML", reply_markup=add_part_keyboard(code))
-
-    elif step == "delete":
-        code = msg.text.strip()
-        r1 = db_execute("DELETE FROM movie_parts WHERE code = %s", (code,))
-        r2 = db_execute("DELETE FROM movies WHERE code = %s RETURNING code", (code,), fetchone=True)
-        safe_send(msg.chat.id, f"✅ O'chirildi: {code}" if r2 else "❌ Topilmadi")
-        del admin_states[msg.from_user.id]
-
-    elif step == "search_user":
         try:
-            uid = int(msg.text.strip())
-        except ValueError:
-            safe_send(msg.chat.id, "❗ ID raqam bo'lishi kerak")
-            del admin_states[msg.from_user.id]
-            return
-        user = db_execute("SELECT id, name, joined_at FROM bot_users WHERE id = %s", (uid,), fetchone=True)
-        if not user:
-            safe_send(msg.chat.id, f"❌ ID <code>{uid}</code> topilmadi", parse_mode="HTML")
-            del admin_states[msg.from_user.id]
-            return
-        u_id, u_name, u_joined = user
-        date_str = u_joined.strftime("%d.%m.%Y %H:%M") if u_joined else "—"
-        name_safe = (u_name or "—").replace("<", "&lt;").replace(">", "&gt;")
-        try:
-            chat = bot.get_chat(u_id)
-            username = f"@{chat.username}" if chat.username else "yo'q"
-            full_name = f"{chat.first_name or ''} {chat.last_name or ''}".strip() or "—"
-            full_name_safe = full_name.replace("<", "&lt;").replace(">", "&gt;")
-        except:
-            username = "yo'q"
-            full_name_safe = name_safe
-        is_subbed, _ = check_sub(u_id)
-        is_subscribed = "✅ Ha" if is_subbed else "❌ Yo'q"
-        is_user_admin = "👑 Ha" if is_admin(u_id) else "❌ Yo'q"
-        text = (f"👤 <b>User ma'lumoti</b>\n\n"
-                f"🆔 ID: <code>{u_id}</code>\n"
-                f"👨 Ism: {full_name_safe}\n"
-                f"📛 Username: {username}\n"
-                f"📅 Qo'shilgan: {date_str}\n"
-                f"📢 Obuna: {is_subscribed}\n"
-                f"👑 Admin: {is_user_admin}")
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("✉️ Xabar yuborish", callback_data=f"msg_user_{u_id}"))
-        if is_main_admin(msg.from_user.id) and not is_admin(u_id):
-            kb.add(types.InlineKeyboardButton("👑 Admin qilish", callback_data=f"make_admin_{u_id}"))
-        safe_send(msg.chat.id, text, parse_mode="HTML", reply_markup=kb)
-        del admin_states[msg.from_user.id]
+            with open(fayl,"rb") as f: bot.send_document(chat_id, f, caption=cap, parse_mode="HTML")
+        except: yuborish(chat_id,"❌ Yuborishda xatolik")
+    finally:
+        try: os.remove(fayl)
+        except: pass
 
-    elif step == "add_admin_id":
-        try:
-            new_id = int(msg.text.strip())
-        except ValueError:
-            safe_send(msg.chat.id, "❗ ID raqam bo'lishi kerak")
-            del admin_states[msg.from_user.id]
-            return
-        db_execute("INSERT INTO admins (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (new_id,))
-        cache_del(f"admin_{new_id}")
-        safe_send(msg.chat.id, f"✅ Admin qo'shildi: <code>{new_id}</code>", parse_mode="HTML")
-        try:
-            safe_send(new_id, "🎉 Siz admin bo'ldingiz! /start bosing.")
-        except:
-            pass
-        del admin_states[msg.from_user.id]
-        show_admins_panel(msg.chat.id, True)
+def audio_yuborish(chat_id, fayl, nom, dur, muallif):
+    cap = f"🎵 <b>{nom}</b>"
+    if muallif: cap += f"\n👤 {muallif}"
+    d = davomiylik(dur)
+    if d: cap += f"\n⏱ {d}"
+    cap += "\n\n🎛 Effekt tanlang:"
+    try:
+        with open(fayl,"rb") as f: bot.send_audio(chat_id, f, title=nom, caption=cap, parse_mode="HTML", reply_markup=effektlar_kb())
+    except: yuborish(chat_id,"❌ Yuborishda xatolik")
 
-    elif step == "kanal_set":
-        username = msg.text.strip()
-        if not username.startswith("@"):
-            username = "@" + username
-        try:
-            bot.get_chat(username)
-            channels = get_channels()
-            if username in channels:
-                safe_send(msg.chat.id, f"⚠️ {username} allaqachon qo'shilgan!")
-                del admin_states[msg.from_user.id]
-                return
-            if len(channels) >= 5:
-                safe_send(msg.chat.id, "❌ Maksimum 5 ta kanal qo'shish mumkin!")
-                del admin_states[msg.from_user.id]
-                return
-            channels.append(username)
-            save_channels(channels)
-            safe_send(msg.chat.id,
-                f"✅ Kanal qo'shildi: <b>{username}</b>\nJami: {len(channels)}/5 ta kanal",
-                parse_mode="HTML", reply_markup=admin_keyboard(msg.from_user.id))
-        except:
-            safe_send(msg.chat.id,
-                "❌ Kanal topilmadi!\n\n⚠️ Bot kanalga admin bo'lishi kerak.", parse_mode="HTML")
-        del admin_states[msg.from_user.id]
+admin_holat: dict = {}
+user_holat:  dict = {}
+audio_kesh:  dict = {}
 
-    elif step == "send_to_user":
-        target_id = state["data"]["target_id"]
-        try:
-            bot.copy_message(target_id, msg.chat.id, msg.message_id)
-            safe_send(msg.chat.id, f"✅ Xabar yuborildi <code>{target_id}</code> ga", parse_mode="HTML")
-        except Exception as e:
-            safe_send(msg.chat.id, f"❌ Xato: {str(e)[:200]}")
-        del admin_states[msg.from_user.id]
+@bot.message_handler(commands=["start"])
+def start(msg):
+    uid = msg.from_user.id
+    db("INSERT INTO bot_users (id,name) VALUES (%s,%s) ON CONFLICT DO NOTHING", (uid, msg.from_user.first_name or ""))
+    if admin_mi(uid):
+        yuborish(msg.chat.id, f"👑 Salom, Admin!", reply_markup=admin_kb(uid)); return
+    ok, ul = obuna_tekshir(uid)
+    if not ok:
+        yuborish(msg.chat.id,"❗ Botdan foydalanish uchun kanallarga obuna bo'ling:", reply_markup=obuna_kb(ul)); return
+    yuborish(msg.chat.id, "🎬 <b>Salom!</b>\n\n🔢 Kino kodini yuboring\n📸 Kino rasmi yuboring — bot topadi!\n📥 Yoki quyidagi tugmalar:", parse_mode="HTML", reply_markup=user_kb())
 
-    elif step == "broadcast":
-        users = db_execute("SELECT id FROM bot_users", fetch=True) or []
-        total = len(users)
-        safe_send(msg.chat.id, f"📨 Yuborish boshlandi... ({total} ta user)")
-        sent = 0
-        failed = 0
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            results = executor.map(lambda uid: send_to_user(uid[0], msg), users)
-            for result in results:
-                if result:
-                    sent += 1
-                else:
-                    failed += 1
-        safe_send(msg.chat.id, f"✅ Yuborildi: {sent}\n❌ Yuborilmadi: {failed}\n📊 Jami: {total}")
-        del admin_states[msg.from_user.id]
+@bot.message_handler(commands=["myid"])
+def myid(msg):
+    yuborish(msg.chat.id, f"🆔 Sizning ID: <code>{msg.from_user.id}</code>", parse_mode="HTML")
 
-@bot.message_handler(func=lambda m: True)
-def get_movie(msg):
-    if is_admin(msg.from_user.id):
-        return
-    is_subbed, not_subbed = check_sub(msg.from_user.id)
-    if not is_subbed:
-        safe_send(msg.chat.id,
-            "❗ Avval quyidagi kanal(lar)ga obuna bo'ling:",
-            reply_markup=sub_keyboard(not_subbed))
-        return
-    code = msg.text.strip()
-    movie = db_execute("SELECT name FROM movies WHERE code = %s", (code,), fetchone=True)
-    if not movie:
-        safe_send(msg.chat.id, "❌ Bunday kodli kino topilmadi")
-        return
-    name = movie[0]
-    parts = db_execute("SELECT part_num, file_id FROM movie_parts WHERE code=%s ORDER BY part_num",
-                       (code,), fetch=True) or []
-    if not parts:
-        safe_send(msg.chat.id, "❌ Kino fayli topilmadi")
-        return
-    channels = get_channels()
-    ch_text = channels[0] if channels else ""
-    db_execute("UPDATE movies SET views = views + 1 WHERE code = %s", (code,))
-    for part_num, file_id in parts:
-        if len(parts) == 1:
-            caption = f"🎬 <b>{name}</b>\n\n📢 {ch_text}"
-        else:
-            caption = f"🎬 <b>{name}</b> — {part_num}-qism\n\n📢 {ch_text}"
+@bot.callback_query_handler(func=lambda c: c.data=="obuna_tekshir")
+def obuna_cb(call):
+    uid = call.from_user.id
+    kesh_del(f"sub_{uid}")
+    ok, ul = obuna_tekshir(uid)
+    if ok:
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
+        yuborish(call.message.chat.id,"✅ Rahmat! Kino kodini yuboring:", reply_markup=user_kb())
+    else:
+        bot.answer_callback_query(call.id,"❗ Hali barcha kanallarga obuna bo'lmagansiz!", show_alert=True)
+
+@bot.message_handler(func=lambda m: not admin_mi(m.from_user.id) and m.text=="📥 Video yuklab olish")
+def video_btn(msg):
+    user_holat[msg.from_user.id] = {"rejim":"video"}
+    yuborish(msg.chat.id,"📥 <b>Video yuklab olish</b>\n\nYouTube, TikTok, Instagram, Pinterest, Twitter, Facebook, VK, Dailymotion, Vimeo, Twitch, SoundCloud, Reddit...\n\n🔗 Havola yuboring:\n\n❌ Bekor: /start", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: not admin_mi(m.from_user.id) and m.text=="🎵 Musiqa yuklab olish")
+def musiqa_btn(msg):
+    user_holat[msg.from_user.id] = {"rejim":"musiqa"}
+    yuborish(msg.chat.id,"🎵 <b>Musiqa yuklab olish</b>\n\nYouTube yoki SoundCloud havolasini yuboring:\n\n❌ Bekor: /start", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: not admin_mi(m.from_user.id) and m.text=="🔍 Musiqa qidirish")
+def qidiruv_btn(msg):
+    user_holat[msg.from_user.id] = {"rejim":"qidiruv"}
+    yuborish(msg.chat.id,"🔍 <b>Musiqa qidirish</b>\n\nQo'shiq nomini yuboring:\nMisol: <code>Dildora Niyozova Alvido</code>\n\n❌ Bekor: /start", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: not admin_mi(m.from_user.id) and m.text=="🔵 Dumaloq video")
+def doira_btn(msg):
+    user_holat[msg.from_user.id] = {"rejim":"doira"}
+    yuborish(msg.chat.id,"🔵 <b>Dumaloq video</b>\n\nVideo yuboring — bot doira shaklga o'tkazadi!\n\n❌ Bekor: /start", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: not admin_mi(m.from_user.id) and m.text=="🖼 Rasm orqali kino topish")
+def rasm_btn(msg):
+    user_holat[msg.from_user.id] = {"rejim":"rasm"}
+    yuborish(msg.chat.id,"🖼 <b>Rasm orqali kino topish</b>\n\nKino posteri yoki kadrini yuboring!\n\n❌ Bekor: /start", parse_mode="HTML")
+
+@bot.callback_query_handler(func=lambda c: c.data in EFFEKTLAR)
+def effekt_cb(call):
+    uid = call.from_user.id
+    if uid not in audio_kesh:
+        bot.answer_callback_query(call.id,"❌ Audio topilmadi, qaytadan yuklab oling", show_alert=True); return
+    nom_e, filtr = EFFEKTLAR[call.data]
+    bot.answer_callback_query(call.id, f"⏳ {nom_e} qo'llanmoqda...")
+    kirish = audio_kesh[uid].get("fayl")
+    url    = audio_kesh[uid].get("url")
+    nom    = audio_kesh[uid].get("nom","Audio")
+    if not kirish or not os.path.exists(kirish):
+        if not url: yuborish(call.message.chat.id,"❌ Audio topilmadi"); return
+        k = yuborish(call.message.chat.id,"⏬ Qayta yuklanmoqda...")
+        fayl,_,_,_,_,xato = media_yukla(url, audio=True)
+        try: bot.delete_message(call.message.chat.id, k.message_id)
+        except: pass
+        if xato or not fayl: yuklab_xato(call.message.chat.id, xato); return
+        kirish = fayl; audio_kesh[uid]["fayl"] = fayl
+    k = yuborish(call.message.chat.id, f"⚙️ {nom_e} qo'llanmoqda...")
+    chiq = effekt_qollan(kirish, filtr)
+    try: bot.delete_message(call.message.chat.id, k.message_id)
+    except: pass
+    if chiq:
         try:
-            bot.send_video(msg.chat.id, file_id, caption=caption, parse_mode="HTML", protect_content=True)
-        except Exception as e:
-            logging.error(f"Video send error: {e}")
+            with open(chiq,"rb") as f: bot.send_audio(call.message.chat.id, f, title=f"{nom_e} — {nom}", caption=f"🎵 <b>{nom_e}</b>\n🎶 {nom}", parse_mode="HTML", reply_markup=effektlar_kb())
+        finally:
+            try: os.remove(chiq)
+            except: pass
+    else:
+        yuborish(call.message.chat.id,"❌ Effekt qo'llashda xatolik")
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("yukla_musiqa_"))
+def yukla_musiqa_cb(call):
+    vid_id = call.data[len("yukla_musiqa_"):]
+    url = f"https://youtube.com/watch?v={vid_id}"
+    bot.answer_callback_query(call.id,"⏬ Yuklanmoqda...")
+    k = yuborish(call.message.chat.id,"⏬ Yuklanmoqda...")
+    fayl,nom,_,dur,muallif,xato = media_yukla(url, audio=True)
+    try: bot.delete_message(call.message.chat.id, k.message_id)
+    except: pass
+    if xato or not fayl: yuklab_xato(call.message.chat.id, xato); return
+    audio_kesh[call.from_user.id] = {"url":url,"fayl":fayl,"nom":nom}
+    audio_yuborish(call.message.chat.id, fayl, nom, dur, muallif)
+
+@bot.message_handler(func=lambda m: not admin_mi(m.from_user.id), content_types=["photo"])
+def foto_handler(msg):
+    uid = msg.from_user.id
+    ok, ul = obuna_tekshir(uid)
+    if not ok: yuborish(msg.chat.id,"❗ Avval kanallarga obuna bo'ling:", reply_markup=obuna_kb(ul)); return
+    k = yuborish(msg.chat.id,"🔍 Rasm tahlil qilinmoqda... ⏳")
+    try:
+        fi  = bot.get_file(msg.photo[-1].file_id)
+        url = f"https://api.telegram.org/file/bot{TOKEN}/{fi.file_path}"
+        ts  = int(time.time()*1000)
+        img = f"/tmp/rasm_{ts}.jpg"
+        urllib.request.urlretrieve(url, img)
+    except:
+        try: bot.delete_message(msg.chat.id, k.message_id)
+        except: pass
+        yuborish(msg.chat.id,"❌ Rasm yuklab bo'lmadi"); return
+    topilgan = rasmdan_aniqla(img)
+    try: os.remove(img)
+    except: pass
+    try: bot.delete_message(msg.chat.id, k.message_id)
+    except: pass
+    if not topilgan:
+        yuborish(msg.chat.id,"❌ Rasmdan kino aniqlanmadi.\n💡 Kino posteri yoki aniq kadr yuboring."); return
+    baza = []
+    for t in topilgan:
+        for r in bazadan_qidirish(t):
+            if r not in baza: baza.append(r)
+    matn = f"🔍 <b>Natija:</b>\n\n🌐 Aniqlangan: <b>{topilgan[0]}</b>\n\n"
+    if baza:
+        matn += "🎬 <b>Botdagi kinolar:</b>\n"
+        for kod,nom,pid,_ in baza[:5]: matn += f"• Kod: <code>{kod}</code> — {nom}\n"
+        matn += "\n📩 Kodni yuboring → kino keladi!"
+        if baza[0][2]:
+            try: bot.send_photo(msg.chat.id, baza[0][2], caption=matn, parse_mode="HTML"); return
+            except: pass
+    else:
+        matn += f"😔 Botda bu kino yo'q.\n💡 Nomi: <b>{topilgan[0]}</b>"
+    yuborish(msg.chat.id, matn, parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: not admin_mi(m.from_user.id), content_types=["text","video","document"])
+def asosiy(msg):
+    uid  = msg.from_user.id
+    ok, ul = obuna_tekshir(uid)
+    if not ok: yuborish(msg.chat.id,"❗ Avval kanallarga obuna bo'ling:", reply_markup=obuna_kb(ul)); return
+    holat = user_holat.get(uid,{})
+    rejim = holat.get("rejim","")
+    matn  = (msg.text or "").strip()
+
+    if rejim == "video":
+        user_holat.pop(uid,None)
+        if not url_mi(matn): yuborish(msg.chat.id,"❌ Havola noto'g'ri"); return
+        k = yuborish(msg.chat.id,"⏬ Video yuklanmoqda... ⏳")
+        fayl,nom,_,dur,muallif,xato = media_yukla(matn)
+        try: bot.delete_message(msg.chat.id, k.message_id)
+        except: pass
+        if xato or not fayl: yuklab_xato(msg.chat.id, xato); return
+        video_yuborish(msg.chat.id, fayl, nom, dur, muallif)
+
+    elif rejim == "musiqa":
+        user_holat.pop(uid,None)
+        if not url_mi(matn): yuborish(msg.chat.id,"❌ Havola noto'g'ri"); return
+        k = yuborish(msg.chat.id,"⏬ Musiqa yuklanmoqda... 🎵")
+        fayl,nom,_,dur,muallif,xato = media_yukla(matn, audio=True)
+        try: bot.delete_message(msg.chat.id, k.message_id)
+        except: pass
+        if xato or not fayl: yuklab_xato(msg.chat.id, xato); return
+        audio_kesh[uid] = {"url":matn,"fayl":fayl,"nom":nom}
+        audio_yuborish(msg.chat.id, fayl, nom, dur, muallif)
+
+    elif rejim == "qidiruv":
+        user_holat.pop(uid,None)
+        if not matn: return
+        k = yuborish(msg.chat.id, f"🔍 <b>{matn}</b> qidirilmoqda...", parse_mode="HTML")
+        natija = musiqa_qidirish(matn)
+        try: bot.delete_message(msg.chat.id, k.message_id)
+        except: pass
+        if not natija: yuborish(msg.chat.id,"❌ Topilmadi. Boshqacha yozing."); return
+        yuborish(msg.chat.id, f"🎵 <b>Natijalar: «{matn}»</b>", parse_mode="HTML")
+        for item in natija:
+            cap = f"🎵 <b>{item['nom']}</b>\n👤 {item['muallif']}\n⏱ {item['davomiy']}"
+            kb  = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton("⬇️ Yuklab olish", callback_data=f"yukla_musiqa_{item['id']}"))
             try:
-                bot.send_document(msg.chat.id, file_id, caption=caption, parse_mode="HTML", protect_content=True)
+                if item["thumb"]: bot.send_photo(msg.chat.id, item["thumb"], caption=cap, parse_mode="HTML", reply_markup=kb)
+                else: yuborish(msg.chat.id, cap, parse_mode="HTML", reply_markup=kb)
+            except: yuborish(msg.chat.id, cap, parse_mode="HTML", reply_markup=kb)
+
+    elif rejim == "doira":
+        user_holat.pop(uid,None)
+        kirish = None
+        if msg.video:
+            k = yuborish(msg.chat.id,"⏬ Video yuklanmoqda...")
+            try:
+                fi = bot.get_file(msg.video.file_id)
+                dl = f"https://api.telegram.org/file/bot{TOKEN}/{fi.file_path}"
+                kirish = f"/tmp/doira_{int(time.time()*1000)}.mp4"
+                urllib.request.urlretrieve(dl, kirish)
+            except: yuborish(msg.chat.id,"❌ Video yuklab bo'lmadi"); return
+            finally:
+                try: bot.delete_message(msg.chat.id, k.message_id)
+                except: pass
+        elif msg.document and msg.document.mime_type and "video" in msg.document.mime_type:
+            k = yuborish(msg.chat.id,"⏬ Video yuklanmoqda...")
+            try:
+                fi = bot.get_file(msg.document.file_id)
+                dl = f"https://api.telegram.org/file/bot{TOKEN}/{fi.file_path}"
+                kirish = f"/tmp/doira_{int(time.time()*1000)}.mp4"
+                urllib.request.urlretrieve(dl, kirish)
+            except: yuborish(msg.chat.id,"❌ Video yuklab bo'lmadi"); return
+            finally:
+                try: bot.delete_message(msg.chat.id, k.message_id)
+                except: pass
+        elif matn and url_mi(matn):
+            k = yuborish(msg.chat.id,"⏬ Video yuklanmoqda... ⏳")
+            kirish,_,_,_,_,xato = media_yukla(matn)
+            try: bot.delete_message(msg.chat.id, k.message_id)
+            except: pass
+            if xato or not kirish: yuklab_xato(msg.chat.id, xato); return
+        else:
+            yuborish(msg.chat.id,"❌ Video yuboring"); return
+        k = yuborish(msg.chat.id,"🔵 Dumaloq videoga aylantirilmoqda... ⏳")
+        chiq = dumaloq_video(kirish)
+        try: bot.delete_message(msg.chat.id, k.message_id)
+        except: pass
+        try: os.remove(kirish)
+        except: pass
+        if chiq:
+            try:
+                with open(chiq,"rb") as f: bot.send_video_note(msg.chat.id, f, length=384)
+            except: yuborish(msg.chat.id,"❌ Dumaloq video yuborishda xatolik")
+            finally:
+                try: os.remove(chiq)
+                except: pass
+        else:
+            yuborish(msg.chat.id,"❌ Aylantirshda xatolik — video formati mos kelmadi")
+
+    else:
+        if matn and url_mi(matn):
+            k = yuborish(msg.chat.id,"⏬ Yuklanmoqda... ⏳")
+            fayl,nom,_,dur,muallif,xato = media_yukla(matn)
+            try: bot.delete_message(msg.chat.id, k.message_id)
+            except: pass
+            if xato or not fayl: yuklab_xato(msg.chat.id, xato); return
+            video_yuborish(msg.chat.id, fayl, nom, dur, muallif); return
+        if not matn: return
+        kino = db("SELECT nom,poster_id FROM kinolar WHERE kod=%s", (matn,), one=True)
+        if not kino: yuborish(msg.chat.id,"❌ Bunday kodli kino topilmadi"); return
+        nom, poster_id = kino
+        qismlar = db("SELECT qism_num,fayl_id FROM kino_qismlar WHERE kod=%s ORDER BY qism_num", (matn,), fetch=True) or []
+        if not qismlar: yuborish(msg.chat.id,"❌ Kino fayli topilmadi"); return
+        db("UPDATE kinolar SET korishlar=korishlar+1 WHERE kod=%s", (matn,))
+        kanal = kanallar_ol()
+        kanal_text = kanal[0] if kanal else ""
+        if poster_id:
+            try: bot.send_photo(msg.chat.id, poster_id, caption=f"🎬 <b>{nom}</b>", parse_mode="HTML")
+            except: pass
+        for qnum, fid in qismlar:
+            cap = f"🎬 <b>{nom}</b>" + (f" — {qnum}-qism" if len(qismlar)>1 else "")
+            if kanal_text: cap += f"\n\n📢 {kanal_text}"
+            try: bot.send_video(msg.chat.id, fid, caption=cap, parse_mode="HTML")
             except:
-                safe_send(msg.chat.id, f"❌ {part_num}-qism yuborishda xatolik")
+                try: bot.send_document(msg.chat.id, fid, caption=cap, parse_mode="HTML")
+                except: yuborish(msg.chat.id,f"❌ {qnum}-qism yuborishda xatolik")
+
+@bot.message_handler(func=lambda m: admin_mi(m.from_user.id) and m.text=="📊 Statistika")
+def statistika(msg):
+    u = db("SELECT COUNT(*) FROM bot_users",one=True)[0]
+    k = db("SELECT COUNT(*) FROM kinolar",one=True)[0]
+    q = db("SELECT COUNT(*) FROM kino_qismlar",one=True)[0]
+    v = db("SELECT COALESCE(SUM(korishlar),0) FROM kinolar",one=True)[0]
+    yuborish(msg.chat.id,f"📊 <b>Statistika</b>\n\n👥 Foydalanuvchilar: <b>{u}</b>\n🎬 Kinolar: <b>{k}</b>\n🎞 Qismlar: <b>{q}</b>\n👁 Ko'rishlar: <b>{v}</b>", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: admin_mi(m.from_user.id) and m.text=="📋 Kinolar ro'yxati")
+def kinolar_list(msg):
+    lst = db("SELECT k.kod,k.nom,k.korishlar,(SELECT COUNT(*) FROM kino_qismlar WHERE kod=k.kod) FROM kinolar k ORDER BY k.qoshildi DESC LIMIT 50", fetch=True)
+    if not lst: yuborish(msg.chat.id,"📭 Hech qanday kino yo'q"); return
+    matn = "📋 <b>Kinolar:</b>\n\n"
+    for kod,nom,ko,q in lst:
+        matn += f"🔢 <code>{kod}</code> — {nom} (👁{ko}" + (f" | 🎞{q}qism" if q>1 else "") + ")\n"
+    yuborish(msg.chat.id, matn, parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: admin_mi(m.from_user.id) and m.text=="👥 Foydalanuvchilar")
+def foydalanuvchilar(msg):
+    u = db("SELECT COUNT(*) FROM bot_users",one=True)[0]
+    b = db("SELECT COUNT(*) FROM bot_users WHERE qoshildi>=NOW()-INTERVAL '24 hours'",one=True)[0]
+    h = db("SELECT COUNT(*) FROM bot_users WHERE qoshildi>=NOW()-INTERVAL '7 days'",one=True)[0]
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("📋 Ro'yxat", callback_data="user_list_0"))
+    yuborish(msg.chat.id,f"👥 <b>Foydalanuvchilar</b>\n\n📊 Jami: <b>{u}</b>\n📅 Bugun: <b>{b}</b>\n🗓 Hafta: <b>{h}</b>", parse_mode="HTML", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("user_list_"))
+def user_list_cb(call):
+    if not admin_mi(call.from_user.id): return
+    offset = int(call.data.split("_")[-1])
+    limit  = 20
+    lst    = db("SELECT id,name,qoshildi FROM bot_users ORDER BY qoshildi DESC LIMIT %s OFFSET %s",(limit,offset),fetch=True) or []
+    jami   = db("SELECT COUNT(*) FROM bot_users",one=True)[0]
+    if not lst: bot.answer_callback_query(call.id,"📭 Boshqa yo'q"); return
+    matn = f"👥 <b>Userlar</b> ({offset+1}–{offset+len(lst)}/{jami})\n\n"
+    for uid,ism,v in lst:
+        matn += f"🆔 <code>{uid}</code> — {(ism or '—').replace('<','&lt;')} | {v.strftime('%d.%m.%Y %H:%M') if v else '—'}\n"
+    kb = types.InlineKeyboardMarkup()
+    nav = []
+    if offset>0: nav.append(types.InlineKeyboardButton("⬅️",callback_data=f"user_list_{max(0,offset-limit)}"))
+    if offset+limit<jami: nav.append(types.InlineKeyboardButton("➡️",callback_data=f"user_list_{offset+limit}"))
+    if nav: kb.row(*nav)
+    try: bot.edit_message_text(matn, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb)
+    except: yuborish(call.message.chat.id, matn, parse_mode="HTML", reply_markup=kb)
+    bot.answer_callback_query(call.id)
+
+@bot.message_handler(func=lambda m: admin_mi(m.from_user.id) and m.text=="👑 Adminlar")
+def adminlar_menu(msg):
+    adminlar_paneli(msg.chat.id, bosh_admin(msg.from_user.id))
+
+@bot.message_handler(func=lambda m: bosh_admin(m.from_user.id) and m.text=="➕ Admin qo'shish")
+def admin_qosh_btn(msg):
+    admin_holat[msg.from_user.id] = {"qadam":"admin_id"}
+    yuborish(msg.chat.id,"➕ Yangi admin ID sini yuboring:\n💡 Admin <code>/myid</code> yozib bilsin\n\n❌ Bekor: /start", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: bosh_admin(m.from_user.id) and m.text=="❌ Admin o'chirish")
+def admin_ochir_btn(msg):
+    lst = db("SELECT id FROM adminlar ORDER BY qoshildi",fetch=True) or []
+    kb  = types.InlineKeyboardMarkup()
+    bor = False
+    for (aid,) in lst:
+        if aid!=MAIN_ADMIN: kb.add(types.InlineKeyboardButton(f"❌ {aid}",callback_data=f"admin_del_{aid}")); bor=True
+    if not bor: yuborish(msg.chat.id,"📭 O'chiriladigan admin yo'q"); return
+    yuborish(msg.chat.id,"Qaysi adminni o'chirmoqchisiz?", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("admin_del_"))
+def admin_del_cb(call):
+    if not bosh_admin(call.from_user.id): bot.answer_callback_query(call.id,"❌ Faqat asosiy admin",show_alert=True); return
+    aid = int(call.data.split("_")[-1])
+    if aid==MAIN_ADMIN: bot.answer_callback_query(call.id,"❌ Asosiy adminni o'chirib bo'lmaydi!",show_alert=True); return
+    r = db("DELETE FROM adminlar WHERE id=%s RETURNING id",(aid,),one=True)
+    if r:
+        kesh_del(f"adm_{aid}")
+        bot.answer_callback_query(call.id,f"✅ O'chirildi: {aid}",show_alert=True)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
+        adminlar_paneli(call.message.chat.id, True)
+    else: bot.answer_callback_query(call.id,"❌ Topilmadi",show_alert=True)
+
+@bot.callback_query_handler(func=lambda c: c.data=="admin_qosh")
+def admin_qosh_cb(call):
+    if not bosh_admin(call.from_user.id): return
+    admin_holat[call.from_user.id] = {"qadam":"admin_id"}
+    bot.answer_callback_query(call.id)
+    yuborish(call.message.chat.id,"➕ Yangi admin ID sini yuboring:\n💡 Admin <code>/myid</code> yozib bilsin\n\n❌ Bekor: /start", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: admin_mi(m.from_user.id) and m.text=="⚙️ Sozlamalar")
+def sozlamalar_menu(msg):
+    matn, kb = soz_kb()
+    yuborish(msg.chat.id, matn, parse_mode="HTML", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data=="kanal_qosh")
+def kanal_qosh_cb(call):
+    if not admin_mi(call.from_user.id): return
+    if len(kanallar_ol())>=5: bot.answer_callback_query(call.id,"❌ Maksimum 5 ta!",show_alert=True); return
+    admin_holat[call.from_user.id] = {"qadam":"kanal_qosh"}
+    bot.answer_callback_query(call.id)
+    yuborish(call.message.chat.id,"📢 Kanal/guruh username yuboring:\nMisol: <code>@mening_kanalim</code>\n\n❌ Bekor: /start", parse_mode="HTML")
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("kanal_del_"))
+def kanal_del_cb(call):
+    if not admin_mi(call.from_user.id): return
+    idx = int(call.data.split("_")[-1])
+    lst = kanallar_ol()
+    if idx<len(lst):
+        o = lst.pop(idx); kanallar_saqlash(lst)
+        bot.answer_callback_query(call.id,f"✅ {o} o'chirildi!",show_alert=True)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
+        matn,kb = soz_kb(); yuborish(call.message.chat.id, matn, parse_mode="HTML", reply_markup=kb)
+    else: bot.answer_callback_query(call.id,"❌ Topilmadi",show_alert=True)
+
+@bot.message_handler(func=lambda m: admin_mi(m.from_user.id) and m.text=="➕ Kino qo'shish")
+def kino_qosh_btn(msg):
+    admin_holat[msg.from_user.id] = {"qadam":"kod","malumot":{}}
+    yuborish(msg.chat.id,"🔢 Kino kodini yuboring:\nMisol: <code>101</code> yoki <code>serial1</code>", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: admin_mi(m.from_user.id) and m.text=="🗑 Kino o'chirish")
+def kino_ochir_btn(msg):
+    admin_holat[msg.from_user.id] = {"qadam":"kino_ochir"}
+    yuborish(msg.chat.id,"🗑 O'chiriladigan kino kodini yuboring:")
+
+@bot.message_handler(func=lambda m: admin_mi(m.from_user.id) and m.text=="📨 Reklama yuborish")
+def reklama_btn(msg):
+    admin_holat[msg.from_user.id] = {"qadam":"reklama"}
+    yuborish(msg.chat.id,"📨 Yubormoqchi bo'lgan xabaringizni yuboring:")
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("qism_") and c.data!="qism_tayyor")
+def qism_qosh_cb(call):
+    if not admin_mi(call.from_user.id): return
+    kod = call.data[len("qism_"):]
+    q   = db("SELECT COUNT(*) FROM kino_qismlar WHERE kod=%s",(kod,),one=True)[0]
+    admin_holat[call.from_user.id] = {"qadam":"qism_video","malumot":{"kod":kod,"qism_num":q+1}}
+    bot.answer_callback_query(call.id)
+    yuborish(call.message.chat.id,f"🎥 <b>{q+1}-qism</b> videosini yuboring:", parse_mode="HTML")
+
+@bot.callback_query_handler(func=lambda c: c.data=="qism_tayyor")
+def qism_tayyor_cb(call):
+    if not admin_mi(call.from_user.id): return
+    bot.answer_callback_query(call.id,"✅ Kino saqlandi!")
+    try: bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except: pass
+
+@bot.callback_query_handler(func=lambda c: c.data=="poster_skip")
+def poster_skip_cb(call):
+    if not admin_mi(call.from_user.id): return
+    uid = call.from_user.id
+    if uid in admin_holat and admin_holat[uid]["qadam"]=="poster":
+        admin_holat[uid]["qadam"] = "video"
+        bot.answer_callback_query(call.id)
+        yuborish(call.message.chat.id,"🎥 <b>1-qism</b> videosini yuboring:", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: admin_mi(m.from_user.id) and m.from_user.id in admin_holat,
+                     content_types=["text","video","document","photo"])
+def admin_handler(msg):
+    uid   = msg.from_user.id
+    holat = admin_holat[uid]
+    qadam = holat["qadam"]
+
+    if qadam=="kod":
+        holat["malumot"]["kod"] = (msg.text or "").strip()
+        holat["qadam"] = "nom"
+        yuborish(msg.chat.id,"📝 Kino/Serial nomini yuboring:")
+
+    elif qadam=="nom":
+        holat["malumot"]["nom"] = (msg.text or "").strip()
+        holat["qadam"] = "poster"
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("⏭ O'tkazib yuborish",callback_data="poster_skip"))
+        yuborish(msg.chat.id,"🖼 Kino posterini yuboring:\n\nYoki o'tkazib yuboring 👇", reply_markup=kb)
+
+    elif qadam=="poster":
+        if msg.photo: holat["malumot"]["poster"] = msg.photo[-1].file_id
+        holat["qadam"] = "video"
+        yuborish(msg.chat.id,"🎥 <b>1-qism</b> videosini yuboring:", parse_mode="HTML")
+
+    elif qadam=="video":
+        fid = (msg.video and msg.video.file_id) or (msg.document and msg.document.file_id)
+        if not fid: yuborish(msg.chat.id,"❗ Video yuboring"); return
+        kod    = holat["malumot"]["kod"]
+        nom    = holat["malumot"]["nom"]
+        poster = holat["malumot"].get("poster")
+        db("INSERT INTO kinolar (kod,nom,poster_id) VALUES (%s,%s,%s) ON CONFLICT (kod) DO UPDATE SET nom=%s,poster_id=%s",(kod,nom,poster,nom,poster))
+        db("INSERT INTO kino_qismlar (kod,qism_num,fayl_id) VALUES (%s,1,%s) ON CONFLICT (kod,qism_num) DO UPDATE SET fayl_id=%s",(kod,fid,fid))
+        del admin_holat[uid]
+        yuborish(msg.chat.id,f"✅ <b>{nom}</b> qo'shildi!\n🔢 Kod: <code>{kod}</code>\n\nYana qism qo'shishni xohlaysizmi?", parse_mode="HTML", reply_markup=qism_kb(kod))
+
+    elif qadam=="qism_video":
+        fid = (msg.video and msg.video.file_id) or (msg.document and msg.document.file_id)
+        if not fid: yuborish(msg.chat.id,"❗ Video yuboring"); return
+        kod  = holat["malumot"]["kod"]
+        qnum = holat["malumot"]["qism_num"]
+        db("INSERT INTO kino_qismlar (kod,qism_num,fayl_id) VALUES (%s,%s,%s) ON CONFLICT (kod,qism_num) DO UPDATE SET fayl_id=%s",(kod,qnum,fid,fid))
+        del admin_holat[uid]
+        jami = db("SELECT COUNT(*) FROM kino_qismlar WHERE kod=%s",(kod,),one=True)[0]
+        yuborish(msg.chat.id,f"✅ <b>{qnum}-qism</b> qo'shildi! Jami: {jami} qism\n\nYana qism?", parse_mode="HTML", reply_markup=qism_kb(kod))
+
+    elif qadam=="kino_ochir":
+        kod = (msg.text or "").strip()
+        db("DELETE FROM kino_qismlar WHERE kod=%s",(kod,))
+        r = db("DELETE FROM kinolar WHERE kod=%s RETURNING kod",(kod,),one=True)
+        yuborish(msg.chat.id,f"✅ O'chirildi: <code>{kod}</code>" if r else "❌ Bunday kod topilmadi", parse_mode="HTML")
+        del admin_holat[uid]
+
+    elif qadam=="admin_id":
+        try: new_id = int((msg.text or "").strip())
+        except: yuborish(msg.chat.id,"❗ ID raqam bo'lishi kerak"); del admin_holat[uid]; return
+        db("INSERT INTO adminlar (id) VALUES (%s) ON CONFLICT DO NOTHING",(new_id,))
+        kesh_del(f"adm_{new_id}")
+        yuborish(msg.chat.id,f"✅ Admin qo'shildi: <code>{new_id}</code>", parse_mode="HTML")
+        try: yuborish(new_id,"🎉 Siz admin bo'ldingiz! /start bosing.")
+        except: pass
+        del admin_holat[uid]
+        adminlar_paneli(msg.chat.id, True)
+
+    elif qadam=="kanal_qosh":
+        u = (msg.text or "").strip()
+        if not u.startswith("@"): u = "@"+u
+        try:
+            bot.get_chat(u)
+            lst = kanallar_ol()
+            if u in lst: yuborish(msg.chat.id,f"⚠️ {u} allaqachon qo'shilgan!")
+            elif len(lst)>=5: yuborish(msg.chat.id,"❌ Maksimum 5 ta kanal!")
+            else:
+                lst.append(u); kanallar_saqlash(lst)
+                yuborish(msg.chat.id,f"✅ {u} qo'shildi! Jami: {len(lst)}/5", parse_mode="HTML")
+        except: yuborish(msg.chat.id,"❌ Kanal topilmadi!\n⚠️ Bot kanalga admin bo'lishi shart.")
+        del admin_holat[uid]
+
+    elif qadam=="reklama":
+        lst  = db("SELECT id FROM bot_users",fetch=True) or []
+        jami = len(lst)
+        yuborish(msg.chat.id,f"📨 Yuborish boshlandi... ({jami} ta user)")
+        def yuboruvchi(u):
+            try: bot.copy_message(u[0], msg.chat.id, msg.message_id); return True
+            except Exception as e:
+                if "blocked" in str(e).lower() or "deactivated" in str(e).lower():
+                    db("DELETE FROM bot_users WHERE id=%s",(u[0],))
+                return False
+        y = f = 0
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            for r in ex.map(yuboruvchi, lst):
+                if r: y+=1
+                else: f+=1
+        yuborish(msg.chat.id,f"✅ Yuborildi: {y}\n❌ Yuborilmadi: {f}\n📊 Jami: {jami}")
+        del admin_holat[uid]
 
 def keep_alive():
-    render_url = os.getenv("RENDER_EXTERNAL_URL", "")
-    if not render_url:
-        return
+    url = os.getenv("RENDER_EXTERNAL_URL","")
+    if not url: return
     while True:
         try:
-            time.sleep(14 * 60)
-            urllib.request.urlopen(render_url + "/health", timeout=10)
-            logging.info("Keep-alive ping ✅")
-        except Exception as e:
-            logging.warning(f"Keep-alive xato: {e}")
+            time.sleep(14*60)
+            urllib.request.urlopen(url+"/health", timeout=10)
+        except: pass
 
 def run_bot():
     while True:
-        try:
-            logging.info("Bot ishga tushdi...")
-            bot.infinity_polling(timeout=10, long_polling_timeout=5)
-        except Exception as e:
-            logging.error(f"Bot error: {e}")
-            time.sleep(5)
+        try: bot.infinity_polling(timeout=10, long_polling_timeout=5)
+        except Exception as e: log.error(e); time.sleep(5)
 
 if __name__ == "__main__":
     init_db()
-    threading.Thread(target=run_web, daemon=True).start()
-    threading.Thread(target=keep_alive, daemon=True).start()
+    threading.Thread(target=flask_start, daemon=True).start()
+    threading.Thread(target=keep_alive,  daemon=True).start()
     run_bot()
