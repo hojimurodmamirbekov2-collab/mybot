@@ -1,963 +1,1450 @@
-import os
-import re
-import glob
-import time
-import logging
-import threading
-import subprocess
-import urllib.request
-import requests
-import psycopg2
-from psycopg2 import pool
-from flask import Flask
-from concurrent.futures import ThreadPoolExecutor
-import telebot
-from telebot import types
+"""
+╔══════════════════════════════════════════════════════════╗
+║              PRO MEDIA BOT  v3.0                         ║
+║  Video • Musiqa • Kino • Effektlar • Admin Panel         ║
+╚══════════════════════════════════════════════════════════╝
+
+.env fayli:
+  BOT_TOKEN             = @BotFather dan (MAJBURIY)
+  TMDB_API_KEY          = themoviedb.org/settings/api (kino uchun)
+  SPOTIFY_CLIENT_ID     = developer.spotify.com (ixtiyoriy)
+  SPOTIFY_CLIENT_SECRET = (ixtiyoriy)
+  GENIUS_TOKEN          = genius.com/api-clients (ixtiyoriy)
+  ADMIN_IDS             = 123456789,987654321   (vergul bilan)
+"""
+
+import os, re, time, asyncio, tempfile, subprocess, json
+from io import BytesIO
+from datetime import datetime
+from collections import defaultdict
+
+import httpx
 import yt_dlp
+from PIL import Image
+from pydub import AudioSegment
+from pydub.effects import normalize
 
-TOKEN        = os.getenv("BOT_TOKEN", "")
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-CHANNEL      = os.getenv("CHANNEL", "")
-_admin_env   = os.getenv("ADMIN_ID", "0")
-ADMIN_IDS    = [int(x.strip()) for x in _admin_env.split(",") if x.strip().isdigit()]
-MAIN_ADMIN   = ADMIN_IDS[0] if ADMIN_IDS else 0
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters,
+)
+from telegram.constants import ParseMode, ChatAction
+from telegram.error import TimedOut, NetworkError
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
-bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=8)
+try:
+    import spotipy
+    from spotipy.oauth2 import SpotifyClientCredentials
+    SPOTIPY_OK = True
+except ImportError:
+    SPOTIPY_OK = False
 
-_cache: dict = {}
+try:
+    import lyricsgenius
+    GENIUS_OK = True
+except ImportError:
+    GENIUS_OK = False
 
-def kesh_ol(k):
-    e = _cache.get(k)
-    if e and time.time() < e["exp"]:
-        return e["val"], True
-    return None, False
+try:
+    from youtubesearchpython import VideosSearch
+    YTSEARCH_OK = True
+except ImportError:
+    YTSEARCH_OK = False
 
-def kesh_set(k, v, ttl=60):
-    _cache[k] = {"val": v, "exp": time.time() + ttl}
+# ═══════════════════════════════════════════════════════════
+# KONFIGURATSIYA
+# ═══════════════════════════════════════════════════════════
 
-def kesh_del(k):
-    _cache.pop(k, None)
+BOT_TOKEN             = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+TMDB_API_KEY          = os.getenv("TMDB_API_KEY", "")
+SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
+GENIUS_TOKEN          = os.getenv("GENIUS_TOKEN", "")
+ADMIN_IDS_RAW         = os.getenv("ADMIN_IDS", "")
 
-app = Flask(__name__)
+ADMIN_IDS: set[int] = set()
+for _a in ADMIN_IDS_RAW.split(","):
+    if _a.strip().isdigit():
+        ADMIN_IDS.add(int(_a.strip()))
 
-@app.route("/")
-def home():
-    return "Bot ishlayapti"
+TMDB_BASE = "https://api.themoviedb.org/3"
+TMDB_IMG  = "https://image.tmdb.org/t/p/w500"
 
-@app.route("/health")
-def health():
-    return "OK"
+# ─── In-memory storage ────────────────────────────────────
+STATS: dict     = defaultdict(lambda: {"dl": 0, "music": 0, "movies": 0, "effects": 0, "joined": ""})
+USER_INFO: dict = {}   # uid → {"name": str, "username": str, "banned": bool}
+BROADCAST_MSG   = {}   # temp storage
 
-def flask_start():
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, use_reloader=False)
-
-db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DATABASE_URL)
-
-def db(sql, params=None, *, fetch=False, one=False):
-    conn = db_pool.getconn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, params or ())
-            if one:    result = cur.fetchone()
-            elif fetch: result = cur.fetchall()
-            else:       result = None
-            conn.commit()
-            return result
-    except Exception as err:
-        conn.rollback()
-        log.error(f"DB: {err}")
-        return None
-    finally:
-        db_pool.putconn(conn)
-
-def init_db():
-    db("CREATE TABLE IF NOT EXISTS bot_users (id BIGINT PRIMARY KEY, name TEXT, qoshildi TIMESTAMP DEFAULT NOW())")
-    db("CREATE TABLE IF NOT EXISTS kinolar (kod TEXT PRIMARY KEY, nom TEXT, poster_id TEXT, korishlar INTEGER DEFAULT 0, qoshildi TIMESTAMP DEFAULT NOW())")
-    db("ALTER TABLE kinolar ADD COLUMN IF NOT EXISTS poster_id TEXT")
-    db("CREATE TABLE IF NOT EXISTS kino_qismlar (id SERIAL PRIMARY KEY, kod TEXT NOT NULL, qism_num INTEGER NOT NULL, fayl_id TEXT NOT NULL, UNIQUE(kod, qism_num))")
-    db("CREATE TABLE IF NOT EXISTS adminlar (id BIGINT PRIMARY KEY, qoshildi TIMESTAMP DEFAULT NOW())")
-    db("CREATE TABLE IF NOT EXISTS sozlamalar (kalit TEXT PRIMARY KEY, qiymat TEXT)")
-    for aid in ADMIN_IDS:
-        db("INSERT INTO adminlar (id) VALUES (%s) ON CONFLICT DO NOTHING", (aid,))
-    if CHANNEL:
-        db("INSERT INTO sozlamalar (kalit, qiymat) VALUES ('kanallar', %s) ON CONFLICT DO NOTHING", (CHANNEL,))
-
-def kanallar_ol():
-    v, ok = kesh_ol("kanallar")
-    if ok: return v
-    row = db("SELECT qiymat FROM sozlamalar WHERE kalit='kanallar'", one=True)
-    r = [k.strip() for k in row[0].split(",") if k.strip()] if row and row[0] else ([CHANNEL] if CHANNEL else [])
-    kesh_set("kanallar", r, ttl=300)
-    return r
-
-def kanallar_saqlash(lst):
-    v = ",".join(lst)
-    db("INSERT INTO sozlamalar (kalit, qiymat) VALUES ('kanallar',%s) ON CONFLICT (kalit) DO UPDATE SET qiymat=%s", (v, v))
-    kesh_del("kanallar")
-
-def admin_mi(uid):
-    if uid in ADMIN_IDS: return True
-    v, ok = kesh_ol(f"adm_{uid}")
-    if ok: return v
-    r = db("SELECT 1 FROM adminlar WHERE id=%s", (uid,), one=True)
-    kesh_set(f"adm_{uid}", r is not None, ttl=120)
-    return r is not None
-
-def bosh_admin(uid):
-    return uid == MAIN_ADMIN
-
-def obuna_tekshir(uid):
-    kanallar = kanallar_ol()
-    if not kanallar: return True, []
-    v, ok = kesh_ol(f"sub_{uid}")
-    if ok: return v
-    ulanmagan = []
-    for k in kanallar:
-        try:
-            if bot.get_chat_member(k, uid).status not in ("member","administrator","creator"):
-                ulanmagan.append(k)
-        except: pass
-    r = (len(ulanmagan) == 0, ulanmagan)
-    kesh_set(f"sub_{uid}", r, ttl=60)
-    return r
-
-def yuborish(chat_id, matn, **kw):
-    try: return bot.send_message(chat_id, matn, **kw)
-    except Exception as e: log.error(f"Send: {e}")
-
-def user_kb():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("📥 Video yuklab olish",    "🎵 Musiqa yuklab olish")
-    kb.add("🔍 Musiqa qidirish",       "🔵 Dumaloq video")
-    kb.add("🖼 Rasm orqali kino topish", "🎞 Video orqali kino topish")
-    return kb
-
-def admin_kb(uid=None):
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("➕ Kino qo'shish",   "🗑 Kino o'chirish")
-    kb.add("📊 Statistika",       "📋 Kinolar ro'yxati")
-    kb.add("👥 Foydalanuvchilar", "📨 Reklama yuborish")
-    kb.add("👑 Adminlar",         "⚙️ Sozlamalar")
-    if uid and bosh_admin(uid):
-        kb.add("➕ Admin qo'shish", "❌ Admin o'chirish")
-    return kb
-
-def obuna_kb(lst):
-    kb = types.InlineKeyboardMarkup()
-    for k in lst:
-        kb.add(types.InlineKeyboardButton(f"📢 {k} ga obuna bo'lish", url=f"https://t.me/{k.lstrip('@')}"))
-    kb.add(types.InlineKeyboardButton("✅ Obuna bo'ldim, tekshir", callback_data="obuna_tekshir"))
-    return kb
-
-def effektlar_kb():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    btns = [types.InlineKeyboardButton(n, callback_data=k) for k,(n,_) in EFFEKTLAR.items()]
-    for i in range(0, len(btns), 2): kb.row(*btns[i:i+2])
-    return kb
-
-def qism_kb(kod):
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("➕ Yana qism qo'shish", callback_data=f"qism_{kod}"))
-    kb.add(types.InlineKeyboardButton("✅ Tayyor, saqlash",    callback_data="qism_tayyor"))
-    return kb
-
-def soz_kb():
-    kanallar = kanallar_ol()
-    matn = "⚙️ <b>Sozlamalar</b>\n\n"
-    matn += f"📢 Kanallar ({len(kanallar)}/5):\n" if kanallar else "📢 Kanal ulanmagan\n"
-    for i,k in enumerate(kanallar,1): matn += f"  {i}. <b>{k}</b>\n"
-    kb = types.InlineKeyboardMarkup()
-    if len(kanallar) < 5:
-        kb.add(types.InlineKeyboardButton("➕ Kanal/Guruh qo'shish", callback_data="kanal_qosh"))
-    for i,k in enumerate(kanallar):
-        kb.add(types.InlineKeyboardButton(f"❌ {k} ni o'chirish", callback_data=f"kanal_del_{i}"))
-    return matn, kb
-
-def adminlar_paneli(chat_id, bosh):
-    lst  = db("SELECT id FROM adminlar ORDER BY qoshildi", fetch=True) or []
-    matn = "👑 <b>Adminlar:</b>\n\n"
-    kb   = types.InlineKeyboardMarkup()
-    for (aid,) in lst:
-        matn += f"• <code>{aid}</code>{' 👑 (asosiy)' if aid==MAIN_ADMIN else ''}\n"
-        if bosh and aid != MAIN_ADMIN:
-            kb.add(types.InlineKeyboardButton(f"❌ {aid}", callback_data=f"admin_del_{aid}"))
-    if bosh:
-        kb.add(types.InlineKeyboardButton("➕ Admin qo'shish", callback_data="admin_qosh"))
-    yuborish(chat_id, matn, parse_mode="HTML", reply_markup=kb)
-
-EFFEKTLAR = {
-    "eff_bass":      ("🔊 Bass Boost",     "bass=g=10"),
-    "eff_treble":    ("🎵 Treble Boost",   "treble=g=8"),
-    "eff_echo":      ("🌊 Echo",           "aecho=0.8:0.88:60:0.4"),
-    "eff_slrev":     ("🌙 Slowed+Reverb",  "atempo=0.85,aecho=0.8:0.9:1000:0.3"),
-    "eff_speed":     ("⚡ Tezlashtirish",  "atempo=1.5"),
-    "eff_slow":      ("🐌 Sekinlashtirish","atempo=0.75"),
-    "eff_nightcore": ("🎤 Nightcore",      "aresample=48000,asetrate=60000,atempo=0.8"),
-    "eff_volume":    ("📢 Volume+",        "volume=2"),
+AUDIO_EFFECTS = {
+    "bass":   "🔊 Bass Boost",
+    "reverb": "🎵 Reverb",
+    "echo":   "🌊 Echo",
+    "vocal":  "🎤 Vocal Boost",
+    "slow":   "🐢 Slow (0.75x)",
+    "fast":   "🐇 Fast (1.25x)",
+    "rock":   "🎸 Rock",
+    "lofi":   "🎹 Lo-Fi",
 }
 
-def effekt_qollan(kirish, filtr):
-    chiq = f"/tmp/eff_{int(time.time()*1000)}.mp3"
-    try:
-        r = subprocess.run(["ffmpeg","-y","-i",kirish,"-af",filtr,"-codec:a","libmp3lame","-q:a","3",chiq], capture_output=True, timeout=120)
-        if os.path.exists(chiq) and os.path.getsize(chiq) > 0: return chiq
-    except Exception as e: log.error(e)
-    return None
-
-def video_kadr_ol(video_fayl):
-    chiq = f"/tmp/kadr_{int(time.time()*1000)}.jpg"
-    try:
-        r = subprocess.run(
-            ["ffmpeg","-y","-i",video_fayl,"-ss","00:00:03","-frames:v","1","-q:v","2",chiq],
-            capture_output=True, timeout=30
-        )
-        if os.path.exists(chiq) and os.path.getsize(chiq) > 0:
-            return chiq
-        r2 = subprocess.run(
-            ["ffmpeg","-y","-i",video_fayl,"-frames:v","1","-q:v","2",chiq],
-            capture_output=True, timeout=30
-        )
-        if os.path.exists(chiq) and os.path.getsize(chiq) > 0:
-            return chiq
-    except Exception as e:
-        log.error(e)
-    return None
-
-def kino_qidirish_natija(chat_id, img_fayl, yukl_xabar_id=None):
-    topilgan = rasmdan_aniqla(img_fayl)
-    try: os.remove(img_fayl)
-    except: pass
-    if yukl_xabar_id:
-        try: bot.delete_message(chat_id, yukl_xabar_id)
-        except: pass
-    if not topilgan:
-        yuborish(chat_id, "❌ Kino aniqlanmadi.\n💡 Aniqroq rasm yoki video kadri yuboring."); return
-    baza = []
-    for t in topilgan:
-        for r in bazadan_qidirish(t):
-            if r not in baza: baza.append(r)
-    matn = f"🔍 <b>Aniqlangan:</b> <i>{topilgan[0]}</i>\n\n"
-    if baza:
-        matn += "🎬 <b>Botdagi kinolar:</b>\n\n"
-        for kod,nom,pid,ko in baza[:5]:
-            matn += f"🔢 Kod: <code>{kod}</code>  —  {nom}  👁{ko}\n"
-        matn += "\n📩 <b>Kodni yuboring → kino keladi!</b>"
-        if baza[0][2]:
-            try: bot.send_photo(chat_id, baza[0][2], caption=matn, parse_mode="HTML"); return
-            except: pass
-    else:
-        matn += f"😔 Botda bu kino hali yo'q.\n\n🏷 Nomi: <b>{topilgan[0]}</b>"
-    yuborish(chat_id, matn, parse_mode="HTML")
-
-def dumaloq_video(kirish):
-    chiq = f"/tmp/doira_{int(time.time()*1000)}.mp4"
-    vf = "crop=min(iw\\,ih):min(iw\\,ih),scale=384:384"
-    try:
-        r = subprocess.run(["ffmpeg","-y","-i",kirish,"-vf",vf,"-c:v","libx264","-preset","veryfast","-crf","28","-c:a","aac","-b:a","96k","-t","60","-movflags","+faststart","-pix_fmt","yuv420p",chiq], capture_output=True, timeout=180)
-        if os.path.exists(chiq) and os.path.getsize(chiq) > 0: return chiq
-    except Exception as e: log.error(e)
-    return None
-
-PLATFORMALAR = [
-    "youtube.com","youtu.be","tiktok.com","vm.tiktok.com","vt.tiktok.com",
-    "instagram.com","pinterest.com","pin.it","twitter.com","x.com","t.co",
-    "facebook.com","fb.watch","fb.com","vk.com","vkvideo.ru",
-    "dailymotion.com","dai.ly","vimeo.com","twitch.tv","clips.twitch.tv",
-    "soundcloud.com","reddit.com","redd.it","ok.ru","odnoklassniki.ru",
-    "rumble.com","bilibili.com","bilibili.tv","b23.tv",
-    "likee.video","kwai.com","triller.co","snapchat.com",
-    "linkedin.com","streamable.com","coub.com","odysee.com",
-    "bitchute.com","kick.com","nicovideo.jp","nico.ms",
-    "aparat.com","mixcloud.com","bandcamp.com","ted.com",
+PLATFORMS = [
+    ("▶️ YouTube",   "https://youtube.com"),
+    ("📸 Instagram", "https://instagram.com"),
+    ("🎵 TikTok",    "https://tiktok.com"),
+    ("📌 Pinterest", "https://pinterest.com"),
+    ("🐦 Twitter/X", "https://x.com"),
+    ("👥 Facebook",  "https://facebook.com"),
+    ("🎬 Vimeo",     "https://vimeo.com"),
+    ("🎮 Twitch",    "https://twitch.tv"),
+    ("🤖 Reddit",    "https://reddit.com"),
+    ("🎬 Dailymot.", "https://dailymotion.com"),
 ]
 
-def url_mi(t):
-    t = t.strip().lower()
-    return any(p in t for p in PLATFORMALAR) or (t.startswith("http") and "." in t)
+# ═══════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════
 
-def media_yukla(url, audio=False, max_mb=49):
-    ts        = int(time.time()*1000)
-    tmpl      = f"/tmp/ytdl_{ts}.%(ext)s"
-    tiktok_mi = any(x in url.lower() for x in ["tiktok.com","vm.tiktok","vt.tiktok"])
+def is_url(t: str) -> bool:
+    return bool(re.match(r"https?://", t.strip()))
 
-    umumiy = {
-        "outtmpl":      tmpl,
-        "quiet":        True,
-        "no_warnings":  True,
-        "noplaylist":   True,
-        "concurrent_fragment_downloads": 4,
-    }
-
-    if tiktok_mi and not audio:
-        umumiy["extractor_args"] = {
-            "tiktok": {
-                "app_name":    ["musical_ly"],
-                "app_version": ["35.1.3"],
-            }
-        }
-        umumiy["format"] = "download_addr-2/download_addr/play_addr/mp4"
-
-    if audio:
-        opts = {
-            **umumiy,
-            "format": "bestaudio/best",
-            "postprocessors": [{"key":"FFmpegExtractAudio","preferredcodec":"mp3","preferredquality":"192"}],
-        }
-    else:
-        if not tiktok_mi:
-            umumiy["format"] = (
-                f"bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
-                f"/bestvideo[height<=720]+bestaudio"
-                f"/best[height<=720][ext=mp4]"
-                f"/best[height<=720]"
-                f"/best"
-            )
-            umumiy["merge_output_format"] = "mp4"
-        opts = {**umumiy}
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            nom, thumb, dur, muallif = info.get("title","Video"), info.get("thumbnail",""), info.get("duration",0), info.get("uploader","")
-        fls = glob.glob(f"/tmp/ytdl_{ts}*")
-        if not fls: return None, nom, thumb, dur, muallif, "topilmadi"
-        f = fls[0]
-        if os.path.getsize(f)/1024/1024 > max_mb:
-            [os.remove(x) for x in fls]
-            return None, nom, thumb, dur, muallif, "hajm"
-        return f, nom, thumb, dur, muallif, None
-    except Exception as e:
-        m = str(e).lower()
-        xato = "yopiq" if "private" in m else "yosh" if "age" in m else "mavjud_emas" if "unavailab" in m else str(e)[:100]
-        return None, None, None, 0, None, xato
-
-def musiqa_qidirish(sorov, n=4):
-    opts = {"quiet":True,"no_warnings":True,"extract_flat":True,"noplaylist":True}
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            res = ydl.extract_info(f"ytsearch{n}:{sorov}", download=False)
-            lst = []
-            for e in res.get("entries",[]):
-                if not e: continue
-                dur = e.get("duration",0) or 0
-                m,s = divmod(int(dur),60)
-                lst.append({"nom":e.get("title","Nomsiz"),"url":f"https://youtube.com/watch?v={e.get('id','')}","davomiy":f"{m}:{s:02d}","thumb":e.get("thumbnail",""),"id":e.get("id",""),"muallif":e.get("uploader","")})
-            return lst
-    except: return []
-
-def rasmdan_aniqla(fayl):
-    try:
-        h = {"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36","Accept-Language":"ru-RU,ru;q=0.9,en;q=0.8"}
-        with open(fayl,"rb") as f:
-            r = requests.post("https://lens.google.com/upload?ep=gsbubb&hl=ru&re=df", files={"encoded_image":("photo.jpg",f,"image/jpeg")}, headers=h, allow_redirects=True, timeout=20)
-        t = r.text
-        topilgan = []
-        for pat in [r'"knowledgeGraphEntities"[^}]*?"title"\s*:\s*"([^"]{2,80})"',r'"title"\s*:\s*"([^"]{3,80})"',r'"text"\s*:\s*"([A-Za-z0-9\u0400-\u04FF\s\-\:\'\"\!]{4,60})"']:
-            for m in re.findall(pat, t):
-                m = m.strip()
-                tashla = ["Google","Search","Images","Lens","http","www","com","null","true","false"]
-                if m and len(m)>3 and m not in topilgan and not any(x.lower() in m.lower() for x in tashla):
-                    topilgan.append(m)
-        return topilgan[:8]
-    except Exception as e:
-        log.error(e); return []
-
-def bazadan_qidirish(sorov):
-    return db("SELECT kod,nom,poster_id,korishlar FROM kinolar WHERE LOWER(nom) LIKE %s ORDER BY korishlar DESC LIMIT 5", (f"%{sorov.lower()}%",), fetch=True) or []
-
-def davomiylik(s):
-    if not s: return ""
-    m,s = divmod(int(s),60); h,m = divmod(m,60)
+def fmt_dur(sec) -> str:
+    if not sec: return "0:00"
+    h, r = divmod(int(sec), 3600)
+    m, s = divmod(r, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
-def yuklab_xato(chat_id, xato):
-    xabarlar = {"hajm":"❌ Video 49 MB dan katta","yopiq":"❌ Bu video yopiq (private)","yosh":"❌ Yosh chekloviga ega","mavjud_emas":"❌ Video mavjud emas"}
-    yuborish(chat_id, xabarlar.get(xato, f"❌ Yuklab bo'lmadi: {xato[:100]}" if xato else "❌ Yuklab bo'lmadi"))
+def fmt_num(n) -> str:
+    try: return f"{int(n):,}"
+    except: return str(n)
 
-def video_yuborish(chat_id, fayl, nom, dur, muallif):
-    cap = f"🎬 <b>{nom}</b>"
-    if muallif: cap += f"\n👤 {muallif}"
-    d = davomiylik(dur)
-    if d: cap += f"\n⏱ {d}"
-    try:
-        with open(fayl,"rb") as f: bot.send_video(chat_id, f, caption=cap, parse_mode="HTML", supports_streaming=True)
-    except:
-        try:
-            with open(fayl,"rb") as f: bot.send_document(chat_id, f, caption=cap, parse_mode="HTML")
-        except: yuborish(chat_id,"❌ Yuborishda xatolik")
-    finally:
-        try: os.remove(fayl)
-        except: pass
+def is_admin(uid: int) -> bool:
+    return uid in ADMIN_IDS
 
-def audio_yuborish(chat_id, fayl, nom, dur, muallif):
-    cap = f"🎵 <b>{nom}</b>"
-    if muallif: cap += f"\n👤 {muallif}"
-    d = davomiylik(dur)
-    if d: cap += f"\n⏱ {d}"
-    cap += "\n\n🎛 Effekt tanlang:"
-    try:
-        with open(fayl,"rb") as f: bot.send_audio(chat_id, f, title=nom, caption=cap, parse_mode="HTML", reply_markup=effektlar_kb())
-    except: yuborish(chat_id,"❌ Yuborishda xatolik")
+def is_banned(uid: int) -> bool:
+    return USER_INFO.get(uid, {}).get("banned", False)
 
-admin_holat: dict = {}
-user_holat:  dict = {}
-audio_kesh:  dict = {}
-
-@bot.message_handler(commands=["start"])
-def start(msg):
-    uid = msg.from_user.id
-    db("INSERT INTO bot_users (id,name) VALUES (%s,%s) ON CONFLICT DO NOTHING", (uid, msg.from_user.first_name or ""))
-    if admin_mi(uid):
-        yuborish(msg.chat.id, f"👑 Salom, Admin!", reply_markup=admin_kb(uid)); return
-    ok, ul = obuna_tekshir(uid)
-    if not ok:
-        yuborish(msg.chat.id,"❗ Botdan foydalanish uchun kanallarga obuna bo'ling:", reply_markup=obuna_kb(ul)); return
-    yuborish(msg.chat.id,
-        "🎬 <b>Salom! Kino botga xush kelibsiz!</b>\n\n"
-        "🔢 <b>Kino kodini</b> yuboring → kino keladi\n"
-        "🖼 <b>Rasm</b> yuboring → kino topiladi\n"
-        "🎞 <b>Video klip</b> yuboring → kino topiladi\n\n"
-        "📥 Yoki pastdagi tugmalardan foydalaning 👇",
-        parse_mode="HTML", reply_markup=user_kb())
-
-@bot.message_handler(commands=["myid"])
-def myid(msg):
-    yuborish(msg.chat.id, f"🆔 Sizning ID: <code>{msg.from_user.id}</code>", parse_mode="HTML")
-
-@bot.callback_query_handler(func=lambda c: c.data=="obuna_tekshir")
-def obuna_cb(call):
-    uid = call.from_user.id
-    kesh_del(f"sub_{uid}")
-    ok, ul = obuna_tekshir(uid)
-    if ok:
-        try: bot.delete_message(call.message.chat.id, call.message.message_id)
-        except: pass
-        yuborish(call.message.chat.id,"✅ Rahmat! Kino kodini yuboring:", reply_markup=user_kb())
+def register_user(user):
+    uid = user.id
+    if uid not in USER_INFO:
+        USER_INFO[uid] = {
+            "name": user.full_name,
+            "username": user.username or "",
+            "banned": False,
+            "id": uid,
+        }
+        STATS[uid]["joined"] = datetime.now().strftime("%d.%m.%Y %H:%M")
     else:
-        bot.answer_callback_query(call.id,"❗ Hali barcha kanallarga obuna bo'lmagansiz!", show_alert=True)
+        USER_INFO[uid]["name"] = user.full_name
+        USER_INFO[uid]["username"] = user.username or ""
 
-@bot.message_handler(func=lambda m: not admin_mi(m.from_user.id) and m.text=="📥 Video yuklab olish")
-def video_btn(msg):
-    user_holat[msg.from_user.id] = {"rejim":"video"}
-    yuborish(msg.chat.id,"📥 <b>Video yuklab olish</b>\n\nYouTube, TikTok, Instagram, Pinterest, Twitter, Facebook, VK, Dailymotion, Vimeo, Twitch, SoundCloud, Reddit...\n\n🔗 Havola yuboring:\n\n❌ Bekor: /start", parse_mode="HTML")
+def record(uid: int, key: str):
+    STATS[uid][key] += 1
 
-@bot.message_handler(func=lambda m: not admin_mi(m.from_user.id) and m.text=="🎵 Musiqa yuklab olish")
-def musiqa_btn(msg):
-    user_holat[msg.from_user.id] = {"rejim":"musiqa"}
-    yuborish(msg.chat.id,"🎵 <b>Musiqa yuklab olish</b>\n\nYouTube yoki SoundCloud havolasini yuboring:\n\n❌ Bekor: /start", parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: not admin_mi(m.from_user.id) and m.text=="🔍 Musiqa qidirish")
-def qidiruv_btn(msg):
-    user_holat[msg.from_user.id] = {"rejim":"qidiruv"}
-    yuborish(msg.chat.id,"🔍 <b>Musiqa qidirish</b>\n\nQo'shiq nomini yuboring:\nMisol: <code>Dildora Niyozova Alvido</code>\n\n❌ Bekor: /start", parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: not admin_mi(m.from_user.id) and m.text=="🔵 Dumaloq video")
-def doira_btn(msg):
-    user_holat[msg.from_user.id] = {"rejim":"doira"}
-    yuborish(msg.chat.id,"🔵 <b>Dumaloq video</b>\n\nVideo yuboring — bot doira shaklga o'tkazadi!\n\n❌ Bekor: /start", parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: not admin_mi(m.from_user.id) and m.text=="🖼 Rasm orqali kino topish")
-def rasm_btn(msg):
-    user_holat[msg.from_user.id] = {"rejim":"rasm"}
-    yuborish(msg.chat.id,"🖼 <b>Rasm orqali kino topish</b>\n\nKino posteri yoki kadrini yuboring!\n\n❌ Bekor: /start", parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: not admin_mi(m.from_user.id) and m.text=="🎞 Video orqali kino topish")
-def video_kino_btn(msg):
-    user_holat[msg.from_user.id] = {"rejim":"kino_video"}
-    yuborish(msg.chat.id,"🎞 <b>Video orqali kino topish</b>\n\nKino yoki serialdan qisqa klip yuboring!\nBot kadrni tahlil qilib kino nomini aniqlaydi 🤖\n\n❌ Bekor: /start", parse_mode="HTML")
-
-@bot.callback_query_handler(func=lambda c: c.data in EFFEKTLAR)
-def effekt_cb(call):
-    uid = call.from_user.id
-    if uid not in audio_kesh:
-        bot.answer_callback_query(call.id,"❌ Audio topilmadi, qaytadan yuklab oling", show_alert=True); return
-    nom_e, filtr = EFFEKTLAR[call.data]
-    bot.answer_callback_query(call.id, f"⏳ {nom_e} qo'llanmoqda...")
-    kirish = audio_kesh[uid].get("fayl")
-    url    = audio_kesh[uid].get("url")
-    nom    = audio_kesh[uid].get("nom","Audio")
-    if not kirish or not os.path.exists(kirish):
-        if not url: yuborish(call.message.chat.id,"❌ Audio topilmadi"); return
-        k = yuborish(call.message.chat.id,"⏬ Qayta yuklanmoqda...")
-        fayl,_,_,_,_,xato = media_yukla(url, audio=True)
-        try: bot.delete_message(call.message.chat.id, k.message_id)
-        except: pass
-        if xato or not fayl: yuklab_xato(call.message.chat.id, xato); return
-        kirish = fayl; audio_kesh[uid]["fayl"] = fayl
-    k = yuborish(call.message.chat.id, f"⚙️ {nom_e} qo'llanmoqda...")
-    chiq = effekt_qollan(kirish, filtr)
-    try: bot.delete_message(call.message.chat.id, k.message_id)
-    except: pass
-    if chiq:
-        try:
-            with open(chiq,"rb") as f: bot.send_audio(call.message.chat.id, f, title=f"{nom_e} — {nom}", caption=f"🎵 <b>{nom_e}</b>\n🎶 {nom}", parse_mode="HTML", reply_markup=effektlar_kb())
-        finally:
-            try: os.remove(chiq)
-            except: pass
-    else:
-        yuborish(call.message.chat.id,"❌ Effekt qo'llashda xatolik")
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("yukla_musiqa_"))
-def yukla_musiqa_cb(call):
-    vid_id = call.data[len("yukla_musiqa_"):]
-    url = f"https://youtube.com/watch?v={vid_id}"
-    bot.answer_callback_query(call.id,"⏬ Yuklanmoqda...")
-    k = yuborish(call.message.chat.id,"⏬ Yuklanmoqda...")
-    fayl,nom,_,dur,muallif,xato = media_yukla(url, audio=True)
-    try: bot.delete_message(call.message.chat.id, k.message_id)
-    except: pass
-    if xato or not fayl: yuklab_xato(call.message.chat.id, xato); return
-    audio_kesh[call.from_user.id] = {"url":url,"fayl":fayl,"nom":nom}
-    audio_yuborish(call.message.chat.id, fayl, nom, dur, muallif)
-
-@bot.message_handler(func=lambda m: not admin_mi(m.from_user.id), content_types=["photo"])
-def foto_handler(msg):
-    uid = msg.from_user.id
-    ok, ul = obuna_tekshir(uid)
-    if not ok: yuborish(msg.chat.id,"❗ Avval kanallarga obuna bo'ling:", reply_markup=obuna_kb(ul)); return
-    k = yuborish(msg.chat.id,"🔍 Rasm tahlil qilinmoqda... ⏳")
+async def typing(update: Update):
     try:
-        fi  = bot.get_file(msg.photo[-1].file_id)
-        dl  = f"https://api.telegram.org/file/bot{TOKEN}/{fi.file_path}"
-        img = f"/tmp/rasm_{int(time.time()*1000)}.jpg"
-        urllib.request.urlretrieve(dl, img)
-    except:
-        try: bot.delete_message(msg.chat.id, k.message_id)
-        except: pass
-        yuborish(msg.chat.id,"❌ Rasm yuklab bo'lmadi"); return
-    kino_qidirish_natija(msg.chat.id, img, k.message_id)
-
-@bot.message_handler(func=lambda m: not admin_mi(m.from_user.id), content_types=["text","video","document"])
-def asosiy(msg):
-    uid  = msg.from_user.id
-    ok, ul = obuna_tekshir(uid)
-    if not ok: yuborish(msg.chat.id,"❗ Avval kanallarga obuna bo'ling:", reply_markup=obuna_kb(ul)); return
-    holat = user_holat.get(uid,{})
-    rejim = holat.get("rejim","")
-    matn  = (msg.text or "").strip()
-
-    if rejim == "video":
-        user_holat.pop(uid,None)
-        if not url_mi(matn): yuborish(msg.chat.id,"❌ Havola noto'g'ri"); return
-        k = yuborish(msg.chat.id,"⏬ Video yuklanmoqda... ⏳")
-        fayl,nom,_,dur,muallif,xato = media_yukla(matn)
-        try: bot.delete_message(msg.chat.id, k.message_id)
-        except: pass
-        if xato or not fayl: yuklab_xato(msg.chat.id, xato); return
-        video_yuborish(msg.chat.id, fayl, nom, dur, muallif)
-
-    elif rejim == "musiqa":
-        user_holat.pop(uid,None)
-        if not url_mi(matn): yuborish(msg.chat.id,"❌ Havola noto'g'ri"); return
-        k = yuborish(msg.chat.id,"⏬ Musiqa yuklanmoqda... 🎵")
-        fayl,nom,_,dur,muallif,xato = media_yukla(matn, audio=True)
-        try: bot.delete_message(msg.chat.id, k.message_id)
-        except: pass
-        if xato or not fayl: yuklab_xato(msg.chat.id, xato); return
-        audio_kesh[uid] = {"url":matn,"fayl":fayl,"nom":nom}
-        audio_yuborish(msg.chat.id, fayl, nom, dur, muallif)
-
-    elif rejim == "qidiruv":
-        user_holat.pop(uid,None)
-        if not matn: return
-        k = yuborish(msg.chat.id, f"🔍 <b>{matn}</b> qidirilmoqda...", parse_mode="HTML")
-        natija = musiqa_qidirish(matn)
-        try: bot.delete_message(msg.chat.id, k.message_id)
-        except: pass
-        if not natija: yuborish(msg.chat.id,"❌ Topilmadi. Boshqacha yozing."); return
-        yuborish(msg.chat.id, f"🎵 <b>Natijalar: «{matn}»</b>", parse_mode="HTML")
-        for item in natija:
-            cap = f"🎵 <b>{item['nom']}</b>\n👤 {item['muallif']}\n⏱ {item['davomiy']}"
-            kb  = types.InlineKeyboardMarkup()
-            kb.add(types.InlineKeyboardButton("⬇️ Yuklab olish", callback_data=f"yukla_musiqa_{item['id']}"))
-            try:
-                if item["thumb"]: bot.send_photo(msg.chat.id, item["thumb"], caption=cap, parse_mode="HTML", reply_markup=kb)
-                else: yuborish(msg.chat.id, cap, parse_mode="HTML", reply_markup=kb)
-            except: yuborish(msg.chat.id, cap, parse_mode="HTML", reply_markup=kb)
-
-    elif rejim == "kino_video":
-        user_holat.pop(uid,None)
-        vid_fayl = None
-        if msg.video:
-            k = yuborish(msg.chat.id,"⏬ Video yuklanmoqda... ⏳")
-            try:
-                fi = bot.get_file(msg.video.file_id)
-                dl = f"https://api.telegram.org/file/bot{TOKEN}/{fi.file_path}"
-                vid_fayl = f"/tmp/kv_{int(time.time()*1000)}.mp4"
-                urllib.request.urlretrieve(dl, vid_fayl)
-                try: bot.delete_message(msg.chat.id, k.message_id)
-                except: pass
-            except:
-                try: bot.delete_message(msg.chat.id, k.message_id)
-                except: pass
-                yuborish(msg.chat.id,"❌ Video yuklab bo'lmadi"); return
-        elif msg.document and msg.document.mime_type and "video" in msg.document.mime_type:
-            k = yuborish(msg.chat.id,"⏬ Video yuklanmoqda... ⏳")
-            try:
-                fi = bot.get_file(msg.document.file_id)
-                dl = f"https://api.telegram.org/file/bot{TOKEN}/{fi.file_path}"
-                vid_fayl = f"/tmp/kv_{int(time.time()*1000)}.mp4"
-                urllib.request.urlretrieve(dl, vid_fayl)
-                try: bot.delete_message(msg.chat.id, k.message_id)
-                except: pass
-            except:
-                try: bot.delete_message(msg.chat.id, k.message_id)
-                except: pass
-                yuborish(msg.chat.id,"❌ Video yuklab bo'lmadi"); return
-        else:
-            yuborish(msg.chat.id,"❌ Video yuboring (rasm uchun 🖼 tugmasini ishlating)"); return
-        k2 = yuborish(msg.chat.id,"🎞 Kadr aniqlanmoqda... ⏳")
-        kadr = video_kadr_ol(vid_fayl)
-        try: os.remove(vid_fayl)
-        except: pass
-        if not kadr:
-            try: bot.delete_message(msg.chat.id, k2.message_id)
-            except: pass
-            yuborish(msg.chat.id,"❌ Videodan kadr olib bo'lmadi\n💡 Boshqa format sinab ko'ring"); return
-        kino_qidirish_natija(msg.chat.id, kadr, k2.message_id)
-
-    elif rejim == "doira":
-        user_holat.pop(uid,None)
-        kirish = None
-        if msg.video:
-            k = yuborish(msg.chat.id,"⏬ Video yuklanmoqda...")
-            try:
-                fi = bot.get_file(msg.video.file_id)
-                dl = f"https://api.telegram.org/file/bot{TOKEN}/{fi.file_path}"
-                kirish = f"/tmp/doira_{int(time.time()*1000)}.mp4"
-                urllib.request.urlretrieve(dl, kirish)
-            except: yuborish(msg.chat.id,"❌ Video yuklab bo'lmadi"); return
-            finally:
-                try: bot.delete_message(msg.chat.id, k.message_id)
-                except: pass
-        elif msg.document and msg.document.mime_type and "video" in msg.document.mime_type:
-            k = yuborish(msg.chat.id,"⏬ Video yuklanmoqda...")
-            try:
-                fi = bot.get_file(msg.document.file_id)
-                dl = f"https://api.telegram.org/file/bot{TOKEN}/{fi.file_path}"
-                kirish = f"/tmp/doira_{int(time.time()*1000)}.mp4"
-                urllib.request.urlretrieve(dl, kirish)
-            except: yuborish(msg.chat.id,"❌ Video yuklab bo'lmadi"); return
-            finally:
-                try: bot.delete_message(msg.chat.id, k.message_id)
-                except: pass
-        elif matn and url_mi(matn):
-            k = yuborish(msg.chat.id,"⏬ Video yuklanmoqda... ⏳")
-            kirish,_,_,_,_,xato = media_yukla(matn)
-            try: bot.delete_message(msg.chat.id, k.message_id)
-            except: pass
-            if xato or not kirish: yuklab_xato(msg.chat.id, xato); return
-        else:
-            yuborish(msg.chat.id,"❌ Video yuboring"); return
-        k = yuborish(msg.chat.id,"🔵 Dumaloq videoga aylantirilmoqda... ⏳")
-        chiq = dumaloq_video(kirish)
-        try: bot.delete_message(msg.chat.id, k.message_id)
-        except: pass
-        try: os.remove(kirish)
-        except: pass
-        if chiq:
-            try:
-                with open(chiq,"rb") as f: bot.send_video_note(msg.chat.id, f, length=384)
-            except: yuborish(msg.chat.id,"❌ Dumaloq video yuborishda xatolik")
-            finally:
-                try: os.remove(chiq)
-                except: pass
-        else:
-            yuborish(msg.chat.id,"❌ Aylantirshda xatolik — video formati mos kelmadi")
-
-    else:
-        if matn and url_mi(matn):
-            k = yuborish(msg.chat.id,"⏬ Yuklanmoqda... ⏳")
-            fayl,nom,_,dur,muallif,xato = media_yukla(matn)
-            try: bot.delete_message(msg.chat.id, k.message_id)
-            except: pass
-            if xato or not fayl: yuklab_xato(msg.chat.id, xato); return
-            video_yuborish(msg.chat.id, fayl, nom, dur, muallif); return
-        if not matn: return
-        kino = db("SELECT nom,poster_id FROM kinolar WHERE kod=%s", (matn,), one=True)
-        if not kino: yuborish(msg.chat.id,"❌ Bunday kodli kino topilmadi"); return
-        nom, poster_id = kino
-        qismlar = db("SELECT qism_num,fayl_id FROM kino_qismlar WHERE kod=%s ORDER BY qism_num", (matn,), fetch=True) or []
-        if not qismlar: yuborish(msg.chat.id,"❌ Kino fayli topilmadi"); return
-        db("UPDATE kinolar SET korishlar=korishlar+1 WHERE kod=%s", (matn,))
-        kanal = kanallar_ol()
-        kanal_text = kanal[0] if kanal else ""
-        if poster_id:
-            try: bot.send_photo(msg.chat.id, poster_id, caption=f"🎬 <b>{nom}</b>", parse_mode="HTML", protect_content=True)
-            except: pass
-        for qnum, fid in qismlar:
-            cap = f"🎬 <b>{nom}</b>" + (f" — {qnum}-qism" if len(qismlar)>1 else "")
-            if kanal_text: cap += f"\n\n📢 {kanal_text}"
-            try: bot.send_video(msg.chat.id, fid, caption=cap, parse_mode="HTML", protect_content=True)
-            except:
-                try: bot.send_document(msg.chat.id, fid, caption=cap, parse_mode="HTML", protect_content=True)
-                except: yuborish(msg.chat.id,f"❌ {qnum}-qism yuborishda xatolik")
-
-@bot.message_handler(func=lambda m: admin_mi(m.from_user.id) and m.text=="📊 Statistika")
-def statistika(msg):
-    u = db("SELECT COUNT(*) FROM bot_users",one=True)[0]
-    k = db("SELECT COUNT(*) FROM kinolar",one=True)[0]
-    q = db("SELECT COUNT(*) FROM kino_qismlar",one=True)[0]
-    v = db("SELECT COALESCE(SUM(korishlar),0) FROM kinolar",one=True)[0]
-    yuborish(msg.chat.id,f"📊 <b>Statistika</b>\n\n👥 Foydalanuvchilar: <b>{u}</b>\n🎬 Kinolar: <b>{k}</b>\n🎞 Qismlar: <b>{q}</b>\n👁 Ko'rishlar: <b>{v}</b>", parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: admin_mi(m.from_user.id) and m.text=="📋 Kinolar ro'yxati")
-def kinolar_list(msg):
-    lst = db("SELECT k.kod,k.nom,k.korishlar,(SELECT COUNT(*) FROM kino_qismlar WHERE kod=k.kod) FROM kinolar k ORDER BY k.qoshildi DESC LIMIT 50", fetch=True)
-    if not lst: yuborish(msg.chat.id,"📭 Hech qanday kino yo'q"); return
-    matn = "📋 <b>Kinolar:</b>\n\n"
-    for kod,nom,ko,q in lst:
-        matn += f"🔢 <code>{kod}</code> — {nom} (👁{ko}" + (f" | 🎞{q}qism" if q>1 else "") + ")\n"
-    yuborish(msg.chat.id, matn, parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: admin_mi(m.from_user.id) and m.text=="👥 Foydalanuvchilar")
-def foydalanuvchilar(msg):
-    u = db("SELECT COUNT(*) FROM bot_users",one=True)[0]
-    b = db("SELECT COUNT(*) FROM bot_users WHERE qoshildi>=NOW()-INTERVAL '24 hours'",one=True)[0]
-    h = db("SELECT COUNT(*) FROM bot_users WHERE qoshildi>=NOW()-INTERVAL '7 days'",one=True)[0]
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("📋 Ro'yxat", callback_data="user_list_0"))
-    yuborish(msg.chat.id,f"👥 <b>Foydalanuvchilar</b>\n\n📊 Jami: <b>{u}</b>\n📅 Bugun: <b>{b}</b>\n🗓 Hafta: <b>{h}</b>", parse_mode="HTML", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("user_list_"))
-def user_list_cb(call):
-    if not admin_mi(call.from_user.id): return
-    offset = int(call.data.split("_")[-1])
-    limit  = 20
-    lst    = db("SELECT id,name,qoshildi FROM bot_users ORDER BY qoshildi DESC LIMIT %s OFFSET %s",(limit,offset),fetch=True) or []
-    jami   = db("SELECT COUNT(*) FROM bot_users",one=True)[0]
-    if not lst: bot.answer_callback_query(call.id,"📭 Boshqa yo'q"); return
-    matn = f"👥 <b>Userlar</b> ({offset+1}–{offset+len(lst)}/{jami})\n\n"
-    for uid,ism,v in lst:
-        matn += f"🆔 <code>{uid}</code> — {(ism or '—').replace('<','&lt;')} | {v.strftime('%d.%m.%Y %H:%M') if v else '—'}\n"
-    kb = types.InlineKeyboardMarkup()
-    nav = []
-    if offset>0: nav.append(types.InlineKeyboardButton("⬅️",callback_data=f"user_list_{max(0,offset-limit)}"))
-    if offset+limit<jami: nav.append(types.InlineKeyboardButton("➡️",callback_data=f"user_list_{offset+limit}"))
-    if nav: kb.row(*nav)
-    try: bot.edit_message_text(matn, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb)
-    except: yuborish(call.message.chat.id, matn, parse_mode="HTML", reply_markup=kb)
-    bot.answer_callback_query(call.id)
-
-@bot.message_handler(func=lambda m: admin_mi(m.from_user.id) and m.text=="👑 Adminlar")
-def adminlar_menu(msg):
-    adminlar_paneli(msg.chat.id, bosh_admin(msg.from_user.id))
-
-@bot.message_handler(func=lambda m: bosh_admin(m.from_user.id) and m.text=="➕ Admin qo'shish")
-def admin_qosh_btn(msg):
-    admin_holat[msg.from_user.id] = {"qadam":"admin_id"}
-    yuborish(msg.chat.id,"➕ Yangi admin ID sini yuboring:\n💡 Admin <code>/myid</code> yozib bilsin\n\n❌ Bekor: /start", parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: bosh_admin(m.from_user.id) and m.text=="❌ Admin o'chirish")
-def admin_ochir_btn(msg):
-    lst = db("SELECT id FROM adminlar ORDER BY qoshildi",fetch=True) or []
-    kb  = types.InlineKeyboardMarkup()
-    bor = False
-    for (aid,) in lst:
-        if aid!=MAIN_ADMIN: kb.add(types.InlineKeyboardButton(f"❌ {aid}",callback_data=f"admin_del_{aid}")); bor=True
-    if not bor: yuborish(msg.chat.id,"📭 O'chiriladigan admin yo'q"); return
-    yuborish(msg.chat.id,"Qaysi adminni o'chirmoqchisiz?", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("admin_del_"))
-def admin_del_cb(call):
-    if not bosh_admin(call.from_user.id): bot.answer_callback_query(call.id,"❌ Faqat asosiy admin",show_alert=True); return
-    aid = int(call.data.split("_")[-1])
-    if aid==MAIN_ADMIN: bot.answer_callback_query(call.id,"❌ Asosiy adminni o'chirib bo'lmaydi!",show_alert=True); return
-    r = db("DELETE FROM adminlar WHERE id=%s RETURNING id",(aid,),one=True)
-    if r:
-        kesh_del(f"adm_{aid}")
-        bot.answer_callback_query(call.id,f"✅ O'chirildi: {aid}",show_alert=True)
-        try: bot.delete_message(call.message.chat.id, call.message.message_id)
-        except: pass
-        adminlar_paneli(call.message.chat.id, True)
-    else: bot.answer_callback_query(call.id,"❌ Topilmadi",show_alert=True)
-
-@bot.callback_query_handler(func=lambda c: c.data=="admin_qosh")
-def admin_qosh_cb(call):
-    if not bosh_admin(call.from_user.id): return
-    admin_holat[call.from_user.id] = {"qadam":"admin_id"}
-    bot.answer_callback_query(call.id)
-    yuborish(call.message.chat.id,"➕ Yangi admin ID sini yuboring:\n💡 Admin <code>/myid</code> yozib bilsin\n\n❌ Bekor: /start", parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: admin_mi(m.from_user.id) and m.text=="⚙️ Sozlamalar")
-def sozlamalar_menu(msg):
-    matn, kb = soz_kb()
-    yuborish(msg.chat.id, matn, parse_mode="HTML", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda c: c.data=="kanal_qosh")
-def kanal_qosh_cb(call):
-    if not admin_mi(call.from_user.id): return
-    if len(kanallar_ol())>=5: bot.answer_callback_query(call.id,"❌ Maksimum 5 ta!",show_alert=True); return
-    admin_holat[call.from_user.id] = {"qadam":"kanal_qosh"}
-    bot.answer_callback_query(call.id)
-    yuborish(call.message.chat.id,"📢 Kanal/guruh username yuboring:\nMisol: <code>@mening_kanalim</code>\n\n❌ Bekor: /start", parse_mode="HTML")
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("kanal_del_"))
-def kanal_del_cb(call):
-    if not admin_mi(call.from_user.id): return
-    idx = int(call.data.split("_")[-1])
-    lst = kanallar_ol()
-    if idx<len(lst):
-        o = lst.pop(idx); kanallar_saqlash(lst)
-        bot.answer_callback_query(call.id,f"✅ {o} o'chirildi!",show_alert=True)
-        try: bot.delete_message(call.message.chat.id, call.message.message_id)
-        except: pass
-        matn,kb = soz_kb(); yuborish(call.message.chat.id, matn, parse_mode="HTML", reply_markup=kb)
-    else: bot.answer_callback_query(call.id,"❌ Topilmadi",show_alert=True)
-
-@bot.message_handler(func=lambda m: admin_mi(m.from_user.id) and m.text=="➕ Kino qo'shish")
-def kino_qosh_btn(msg):
-    admin_holat[msg.from_user.id] = {"qadam":"kod","malumot":{}}
-    yuborish(msg.chat.id,"🔢 Kino kodini yuboring:\nMisol: <code>101</code> yoki <code>serial1</code>", parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: admin_mi(m.from_user.id) and m.text=="🗑 Kino o'chirish")
-def kino_ochir_btn(msg):
-    admin_holat[msg.from_user.id] = {"qadam":"kino_ochir"}
-    yuborish(msg.chat.id,"🗑 O'chiriladigan kino kodini yuboring:")
-
-@bot.message_handler(func=lambda m: admin_mi(m.from_user.id) and m.text=="📨 Reklama yuborish")
-def reklama_btn(msg):
-    admin_holat[msg.from_user.id] = {"qadam":"reklama"}
-    yuborish(msg.chat.id,"📨 Yubormoqchi bo'lgan xabaringizni yuboring:")
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("qism_") and c.data!="qism_tayyor")
-def qism_qosh_cb(call):
-    if not admin_mi(call.from_user.id): return
-    kod = call.data[len("qism_"):]
-    q   = db("SELECT COUNT(*) FROM kino_qismlar WHERE kod=%s",(kod,),one=True)[0]
-    admin_holat[call.from_user.id] = {"qadam":"qism_video","malumot":{"kod":kod,"qism_num":q+1}}
-    bot.answer_callback_query(call.id)
-    yuborish(call.message.chat.id,f"🎥 <b>{q+1}-qism</b> videosini yuboring:", parse_mode="HTML")
-
-@bot.callback_query_handler(func=lambda c: c.data=="qism_tayyor")
-def qism_tayyor_cb(call):
-    if not admin_mi(call.from_user.id): return
-    bot.answer_callback_query(call.id,"✅ Kino saqlandi!")
-    try: bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        await update.effective_chat.send_action(ChatAction.TYPING)
     except: pass
 
-@bot.callback_query_handler(func=lambda c: c.data=="poster_skip")
-def poster_skip_cb(call):
-    if not admin_mi(call.from_user.id): return
-    uid = call.from_user.id
-    if uid in admin_holat and admin_holat[uid]["qadam"]=="poster":
-        admin_holat[uid]["qadam"] = "video"
-        bot.answer_callback_query(call.id)
-        yuborish(call.message.chat.id,"🎥 <b>1-qism</b> videosini yuboring:", parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: admin_mi(m.from_user.id) and m.from_user.id in admin_holat,
-                     content_types=["text","video","document","photo"])
-def admin_handler(msg):
-    uid   = msg.from_user.id
-    holat = admin_holat[uid]
-    qadam = holat["qadam"]
-
-    if qadam=="kod":
-        holat["malumot"]["kod"] = (msg.text or "").strip()
-        holat["qadam"] = "nom"
-        yuborish(msg.chat.id,"📝 Kino/Serial nomini yuboring:")
-
-    elif qadam=="nom":
-        holat["malumot"]["nom"] = (msg.text or "").strip()
-        holat["qadam"] = "poster"
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("⏭ O'tkazib yuborish",callback_data="poster_skip"))
-        yuborish(msg.chat.id,"🖼 Kino posterini yuboring:\n\nYoki o'tkazib yuboring 👇", reply_markup=kb)
-
-    elif qadam=="poster":
-        if msg.photo: holat["malumot"]["poster"] = msg.photo[-1].file_id
-        holat["qadam"] = "video"
-        yuborish(msg.chat.id,"🎥 <b>1-qism</b> videosini yuboring:", parse_mode="HTML")
-
-    elif qadam=="video":
-        fid = (msg.video and msg.video.file_id) or (msg.document and msg.document.file_id)
-        if not fid: yuborish(msg.chat.id,"❗ Video yuboring"); return
-        kod    = holat["malumot"]["kod"]
-        nom    = holat["malumot"]["nom"]
-        poster = holat["malumot"].get("poster")
-        db("INSERT INTO kinolar (kod,nom,poster_id) VALUES (%s,%s,%s) ON CONFLICT (kod) DO UPDATE SET nom=%s,poster_id=%s",(kod,nom,poster,nom,poster))
-        db("INSERT INTO kino_qismlar (kod,qism_num,fayl_id) VALUES (%s,1,%s) ON CONFLICT (kod,qism_num) DO UPDATE SET fayl_id=%s",(kod,fid,fid))
-        del admin_holat[uid]
-        yuborish(msg.chat.id,f"✅ <b>{nom}</b> qo'shildi!\n🔢 Kod: <code>{kod}</code>\n\nYana qism qo'shishni xohlaysizmi?", parse_mode="HTML", reply_markup=qism_kb(kod))
-
-    elif qadam=="qism_video":
-        fid = (msg.video and msg.video.file_id) or (msg.document and msg.document.file_id)
-        if not fid: yuborish(msg.chat.id,"❗ Video yuboring"); return
-        kod  = holat["malumot"]["kod"]
-        qnum = holat["malumot"]["qism_num"]
-        db("INSERT INTO kino_qismlar (kod,qism_num,fayl_id) VALUES (%s,%s,%s) ON CONFLICT (kod,qism_num) DO UPDATE SET fayl_id=%s",(kod,qnum,fid,fid))
-        del admin_holat[uid]
-        jami = db("SELECT COUNT(*) FROM kino_qismlar WHERE kod=%s",(kod,),one=True)[0]
-        yuborish(msg.chat.id,f"✅ <b>{qnum}-qism</b> qo'shildi! Jami: {jami} qism\n\nYana qism?", parse_mode="HTML", reply_markup=qism_kb(kod))
-
-    elif qadam=="kino_ochir":
-        kod = (msg.text or "").strip()
-        db("DELETE FROM kino_qismlar WHERE kod=%s",(kod,))
-        r = db("DELETE FROM kinolar WHERE kod=%s RETURNING kod",(kod,),one=True)
-        yuborish(msg.chat.id,f"✅ O'chirildi: <code>{kod}</code>" if r else "❌ Bunday kod topilmadi", parse_mode="HTML")
-        del admin_holat[uid]
-
-    elif qadam=="admin_id":
-        try: new_id = int((msg.text or "").strip())
-        except: yuborish(msg.chat.id,"❗ ID raqam bo'lishi kerak"); del admin_holat[uid]; return
-        db("INSERT INTO adminlar (id) VALUES (%s) ON CONFLICT DO NOTHING",(new_id,))
-        kesh_del(f"adm_{new_id}")
-        yuborish(msg.chat.id,f"✅ Admin qo'shildi: <code>{new_id}</code>", parse_mode="HTML")
-        try: yuborish(new_id,"🎉 Siz admin bo'ldingiz! /start bosing.")
-        except: pass
-        del admin_holat[uid]
-        adminlar_paneli(msg.chat.id, True)
-
-    elif qadam=="kanal_qosh":
-        u = (msg.text or "").strip()
-        if not u.startswith("@"): u = "@"+u
+def sp():
+    if SPOTIPY_OK and SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
         try:
-            bot.get_chat(u)
-            lst = kanallar_ol()
-            if u in lst: yuborish(msg.chat.id,f"⚠️ {u} allaqachon qo'shilgan!")
-            elif len(lst)>=5: yuborish(msg.chat.id,"❌ Maksimum 5 ta kanal!")
+            return spotipy.Spotify(auth_manager=SpotifyClientCredentials(
+                client_id=SPOTIFY_CLIENT_ID,
+                client_secret=SPOTIFY_CLIENT_SECRET))
+        except: pass
+    return None
+
+def gn():
+    if GENIUS_OK and GENIUS_TOKEN:
+        try:
+            return lyricsgenius.Genius(GENIUS_TOKEN, verbose=False,
+                skip_non_songs=True, excluded_terms=["(Remix)", "(Live)"])
+        except: pass
+    return None
+
+# ─── ffmpeg ───────────────────────────────────────────────
+
+def run_ff(args: list) -> bool:
+    return subprocess.run(["ffmpeg", "-y"] + args, capture_output=True).returncode == 0
+
+def make_circle(inp: str) -> str | None:
+    out = inp.replace(".mp4", "_c.webm")
+    ok = run_ff(["-i", inp,
+        "-vf", "crop='min(iw,ih)':'min(iw,ih)',scale=512:512,"
+               "format=yuva420p,"
+               "geq=lum='p(X,Y)':a='if(lte(hypot(X-W/2,Y-H/2),W/2),255,0)'",
+        "-c:v", "libvpx-vp9", "-c:a", "libopus", "-b:v", "1M", out])
+    if ok and os.path.exists(out) and os.path.getsize(out) > 500:
+        return out
+    out2 = inp.replace(".mp4", "_c.mp4")
+    ok2 = run_ff(["-i", inp, "-vf",
+        "crop='min(iw,ih)':'min(iw,ih)',scale=512:512",
+        "-c:v", "libx264", "-c:a", "aac", out2])
+    return out2 if ok2 and os.path.exists(out2) else None
+
+def fx(audio: AudioSegment, eid: str) -> AudioSegment:
+    if eid == "bass":   audio = audio.low_pass_filter(300) + 6
+    elif eid == "reverb":
+        d = (audio - 12).overlay(audio - 18, position=60)
+        audio = audio.overlay(d, position=30)
+    elif eid == "echo":
+        audio = audio.overlay(audio - 8, position=300).overlay(audio - 16, position=600)
+    elif eid == "vocal": audio = audio.high_pass_filter(600) + 5
+    elif eid == "slow":
+        audio = audio._spawn(audio.raw_data, overrides={"frame_rate": int(audio.frame_rate * 0.75)}).set_frame_rate(audio.frame_rate)
+    elif eid == "fast":
+        audio = audio._spawn(audio.raw_data, overrides={"frame_rate": int(audio.frame_rate * 1.25)}).set_frame_rate(audio.frame_rate)
+    elif eid == "rock":  audio = audio.high_pass_filter(200).low_pass_filter(8000) + 3
+    elif eid == "lofi":
+        audio = audio.low_pass_filter(3000) - 3
+        audio = audio._spawn(audio.raw_data, overrides={"frame_rate": int(audio.frame_rate * 0.95)}).set_frame_rate(audio.frame_rate)
+    return normalize(audio)
+
+# ─── yt-dlp ───────────────────────────────────────────────
+
+def _dl_sync(url: str, audio_only: bool, quality: str = "best") -> dict:
+    fmt = "bestaudio/best"
+    if not audio_only:
+        q = {"720": "height<=720", "480": "height<=480"}.get(quality, "")
+        fmt = (f"bestvideo[{q}][ext=mp4]+bestaudio[ext=m4a]/best[{q}][ext=mp4]/best"
+               if q else "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        opts = {
+            "quiet": True, "no_warnings": True, "noplaylist": True,
+            "format": fmt,
+            "outtmpl": os.path.join(tmp, "%(title)s.%(ext)s"),
+            "merge_output_format": "mp4",
+            "writethumbnail": True,
+            "postprocessors": [],
+        }
+        if audio_only:
+            opts["postprocessors"].append({
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3", "preferredquality": "320"})
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+
+        ext = "mp3" if audio_only else "mp4"
+        fdata = tdata = None
+        for fn in os.listdir(tmp):
+            fp = os.path.join(tmp, fn)
+            if fn.endswith(ext) and not fdata:
+                fdata = open(fp, "rb").read()
+            elif fn.endswith((".jpg", ".png", ".webp")) and not tdata:
+                tdata = open(fp, "rb").read()
+
+        return {
+            "data": fdata, "thumb": tdata,
+            "title": info.get("title", "Unknown"),
+            "uploader": info.get("uploader", ""),
+            "duration": info.get("duration", 0),
+            "ext": ext,
+        }
+
+async def ydl(url: str, audio_only: bool, quality: str = "best") -> dict:
+    return await asyncio.get_event_loop().run_in_executor(
+        None, _dl_sync, url, audio_only, quality)
+
+# ─── TMDB ─────────────────────────────────────────────────
+
+async def tmdb(path: str, params: dict | None = None) -> dict | None:
+    if not TMDB_API_KEY: return None
+    p = {"api_key": TMDB_API_KEY, "language": "en-US", **(params or {})}
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(f"{TMDB_BASE}{path}", params=p)
+            if r.status_code == 200: return r.json()
+    except: pass
+    return None
+
+async def tmdb_search(q: str) -> list:
+    d = await tmdb("/search/multi", {"query": q, "include_adult": False})
+    return (d or {}).get("results", [])[:6]
+
+async def tmdb_detail(mid: int, mt: str) -> dict | None:
+    path = f"/{'tv' if mt == 'tv' else 'movie'}/{mid}"
+    return await tmdb(path, {"append_to_response": "credits,videos"})
+
+async def tmdb_img(poster: str) -> bytes | None:
+    if not poster: return None
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get(TMDB_IMG + poster)
+            return r.content if r.status_code == 200 else None
+    except: return None
+
+async def tmdb_trending() -> list:
+    d = await tmdb("/trending/all/week")
+    return (d or {}).get("results", [])[:8]
+
+# ─── Reverse image search ─────────────────────────────────
+
+async def yandex_reverse(img: bytes) -> str | None:
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    try:
+        async with httpx.AsyncClient(timeout=30, headers=headers, follow_redirects=True) as c:
+            r = await c.post("https://yandex.com/images/search",
+                params={"rpt": "imageview", "format": "json"},
+                files={"upfile": ("img.jpg", img, "image/jpeg")})
+            cbir = None
+            if r.headers.get("location"):
+                cbir = "https://yandex.com" + r.headers["location"]
             else:
-                lst.append(u); kanallar_saqlash(lst)
-                yuborish(msg.chat.id,f"✅ {u} qo'shildi! Jami: {len(lst)}/5", parse_mode="HTML")
-        except: yuborish(msg.chat.id,"❌ Kanal topilmadi!\n⚠️ Bot kanalga admin bo'lishi shart.")
-        del admin_holat[uid]
+                m = re.search(r'(?:url|href)=["\']([^"\']*cbir[^"\']*)["\']', r.text)
+                if m:
+                    cbir = m.group(1)
+                    if not cbir.startswith("http"):
+                        cbir = "https://yandex.com" + cbir
+            if not cbir: return None
+            r2 = await c.get(cbir)
+            ts = re.findall(r'"snippet":\s*"([^"]{5,80})"', r2.text)
+            if not ts:
+                ts = re.findall(r'<title[^>]*>([^<]{5,100})</title>', r2.text)
+            if ts:
+                clean = re.sub(r'\s*[—\-|]\s*Yandex.*', '', ts[0]).strip()
+                return clean if len(clean) > 3 else None
+    except: pass
+    return None
 
-    elif qadam=="reklama":
-        lst  = db("SELECT id FROM bot_users",fetch=True) or []
-        jami = len(lst)
-        yuborish(msg.chat.id,f"📨 Yuborish boshlandi... ({jami} ta user)")
-        def yuboruvchi(u):
-            try: bot.copy_message(u[0], msg.chat.id, msg.message_id); return True
-            except Exception as e:
-                if "blocked" in str(e).lower() or "deactivated" in str(e).lower():
-                    db("DELETE FROM bot_users WHERE id=%s",(u[0],))
-                return False
-        y = f = 0
-        with ThreadPoolExecutor(max_workers=20) as ex:
-            for r in ex.map(yuboruvchi, lst):
-                if r: y+=1
-                else: f+=1
-        yuborish(msg.chat.id,f"✅ Yuborildi: {y}\n❌ Yuborilmadi: {f}\n📊 Jami: {jami}")
-        del admin_holat[uid]
+async def google_lens(img: bytes) -> str | None:
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+            r = await c.post("https://lens.google.com/upload",
+                params={"re": "df", "st": str(int(time.time()*1000)), "ep": "gsbubb"},
+                files={"encoded_image": ("img.jpg", img, "image/jpeg")})
+            ts = re.findall(r'"([A-Z][a-zA-Z\s\(\)0-9:]{5,60})"', r.text)
+            movie = [t for t in ts if any(w in t.lower() for w in
+                ["movie","film","series","season","show","2019","2020","2021","2022","2023","2024"])]
+            return movie[0] if movie else (ts[0] if ts else None)
+    except: return None
 
-def keep_alive():
-    url = os.getenv("RENDER_EXTERNAL_URL","")
-    if not url: return
-    while True:
+# ═══════════════════════════════════════════════════════════
+# ★ START — Chiroyli tugmachalar
+# ═══════════════════════════════════════════════════════════
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    register_user(user)
+
+    if is_banned(user.id):
+        await update.message.reply_text("🚫 Siz bloklangansiz.")
+        return
+
+    text = (
+        f"👋 *Salom, {user.first_name}!*\n\n"
+        "🤖 *Pro Media Bot* — quyidagi platformalardan\n"
+        "video va rasmlarni yuklab oling!\n\n"
+        "🔽 Kerakli platformani tanlang:"
+    )
+
+    # Platform tugmalari (2 dona qatoriga)
+    plat_kb = []
+    row = []
+    for name, _ in PLATFORMS:
+        row.append(InlineKeyboardButton(name, callback_data=f"PLT|{name}"))
+        if len(row) == 2:
+            plat_kb.append(row); row = []
+    if row: plat_kb.append(row)
+
+    # Asosiy funksiyalar
+    plat_kb.append([
+        InlineKeyboardButton("🎵 Musiqa yuklab olish", callback_data="MENU|music"),
+        InlineKeyboardButton("🎬 Kino qidirish",       callback_data="MENU|movie"),
+    ])
+    plat_kb.append([
+        InlineKeyboardButton("🎛 Audio Effektlar",     callback_data="MENU|effect"),
+        InlineKeyboardButton("⭕ Aylana Video",         callback_data="MENU|circle"),
+    ])
+    plat_kb.append([
+        InlineKeyboardButton("📊 Statistikam",         callback_data="MENU|stats"),
+        InlineKeyboardButton("❓ Yordam",               callback_data="MENU|help"),
+    ])
+
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(plat_kb))
+
+async def platform_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    name = query.data.split("|", 1)[1]
+
+    platform_info = {
+        "▶️ YouTube":   ("YouTube", "youtube.com/watch?v=...\nyoutu.be/..."),
+        "📸 Instagram": ("Instagram", "instagram.com/p/...\ninstagram.com/reel/..."),
+        "🎵 TikTok":    ("TikTok", "tiktok.com/@user/video/..."),
+        "📌 Pinterest": ("Pinterest", "pin.it/...\npinterest.com/pin/..."),
+        "🐦 Twitter/X": ("Twitter/X", "twitter.com/i/status/...\nx.com/i/status/..."),
+        "👥 Facebook":  ("Facebook", "fb.watch/...\nfacebook.com/watch/..."),
+        "🎬 Vimeo":     ("Vimeo", "vimeo.com/123456"),
+        "🎮 Twitch":    ("Twitch", "twitch.tv/videos/..."),
+        "🤖 Reddit":    ("Reddit", "reddit.com/r/.../..."),
+        "🎬 Dailymot.": ("Dailymotion", "dailymotion.com/video/..."),
+    }
+    pname, example = platform_info.get(name, (name, "havolani yuboring"))
+
+    text = (
+        f"{name} *{pname}*\n\n"
+        f"Havola formatiga misol:\n"
+        f"`{example}`\n\n"
+        f"📋 Havolani bu chatga yuboring — bot avtomatik aniqlaydi!\n\n"
+        f"📥 Sifat tanlash imkoniyati:\n"
+        f"• 🎬 Best sifat\n"
+        f"• 📺 720p HD\n"
+        f"• 📱 480p\n"
+        f"• 🎵 MP3 (faqat ovoz)\n"
+        f"• ⭕ Aylana video (video_note)"
+    )
+    kb = [[InlineKeyboardButton("⬅️ Orqaga", callback_data="BACK|start")]]
+    await query.message.edit_text(text, parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(kb))
+
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split("|", 1)[1]
+    uid = query.from_user.id
+
+    back_btn = [[InlineKeyboardButton("⬅️ Orqaga", callback_data="BACK|start")]]
+
+    if action == "help":
+        text = (
+            "❓ *Qo'llanma*\n\n"
+            "📥 *Video/Rasm yuklab olish:*\n"
+            "Havolani yuboring → sifat tanlang → tayyor!\n"
+            "10+ platformadan ishlaydi\n\n"
+            "🎵 *Musiqa:*\n"
+            "`/music <nom>` — Spotify+YouTube qidirish\n"
+            "`/lyrics <nom>` — qo'shiq matni\n\n"
+            "🎬 *Kino:*\n"
+            "`/movie <nom>` — TMDB dan kino topish\n"
+            "`/trending` — haftalik top kinolar\n"
+            "📸 Rasm yuboring → kinoni rasmdan topadi!\n\n"
+            "🎛 *Effektlar:*\n"
+            "`/effect` → audio yuboring → effekt tanlang\n\n"
+            "⭕ *Aylana video:*\n"
+            "`/circle` → video yuboring"
+        )
+        await query.message.edit_text(text, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(back_btn))
+
+    elif action == "stats":
+        s = STATS[uid]
+        total = s["dl"] + s["music"] + s["movies"] + s["effects"]
+        text = (
+            f"📊 *Sizning statistikangiz*\n\n"
+            f"📥 Video/Audio: `{s['dl']}`\n"
+            f"🎵 Musiqa: `{s['music']}`\n"
+            f"🎬 Kino qidirish: `{s['movies']}`\n"
+            f"🎛 Effektlar: `{s['effects']}`\n"
+            f"─────────────\n"
+            f"📈 Jami: `{total}`\n"
+            f"📅 Qo'shilgan: `{s['joined'] or 'N/A'}`"
+        )
+        await query.message.edit_text(text, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(back_btn))
+
+    elif action == "music":
+        text = (
+            "🎵 *Musiqa yuklab olish*\n\n"
+            "Buyruqdan foydalaning:\n\n"
+            "`/music <qo'shiq nomi>`\n\n"
+            "Misol:\n"
+            "`/music Doja Cat Paint The Town Red`\n"
+            "`/music The Weeknd Blinding Lights`\n\n"
+            "Bot Spotify + YouTube orqali topadi,\n"
+            "rasm + davomiylik bilan ko'rsatadi."
+        )
+        await query.message.edit_text(text, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(back_btn))
+
+    elif action == "movie":
+        text = (
+            "🎬 *Kino qidirish*\n\n"
+            "1️⃣ Buyruq bilan:\n"
+            "`/movie <kino nomi>`\n\n"
+            "2️⃣ Rasm bilan:\n"
+            "Kino posteri yoki aktyor rasmini yuboring!\n"
+            "Bot Yandex orqali aniqlaydi.\n\n"
+            "3️⃣ Trend kinolar:\n"
+            "`/trending` — haftanin top 8 kinosi"
+        )
+        await query.message.edit_text(text, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(back_btn))
+
+    elif action == "effect":
+        eff_kb = []
+        row = []
+        for eid, ename in AUDIO_EFFECTS.items():
+            row.append(InlineKeyboardButton(ename, callback_data=f"EFF|{eid}"))
+            if len(row) == 2:
+                eff_kb.append(row); row = []
+        if row: eff_kb.append(row)
+        eff_kb.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="BACK|start")])
+        context.user_data["effect_waiting"] = True
+        context.user_data["effect_id"] = None
+        await query.message.edit_text(
+            "🎛 *Audio Effektlar*\n\nEffektni tanlang, keyin audio yuboring:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(eff_kb))
+
+    elif action == "circle":
+        context.user_data["circle_waiting"] = True
+        await query.message.edit_text(
+            "⭕ *Aylana Video*\n\nVideo faylni yuboring:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(back_btn))
+
+async def back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.delete()
+    # /start ni qayta yuborish
+    await cmd_start.__wrapped__(update, context) if hasattr(cmd_start, "__wrapped__") else None
+
+# ═══════════════════════════════════════════════════════════
+# VIDEO DOWNLOAD
+# ═══════════════════════════════════════════════════════════
+
+async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+    uid = update.effective_user.id
+    if is_banned(uid):
+        return
+
+    kb = [
+        [InlineKeyboardButton("🎬 Best sifat", callback_data=f"DL|video|best|{url}"),
+         InlineKeyboardButton("📺 720p HD",    callback_data=f"DL|video|720|{url}")],
+        [InlineKeyboardButton("📱 480p",       callback_data=f"DL|video|480|{url}"),
+         InlineKeyboardButton("🎵 MP3 320k",   callback_data=f"DL|audio|best|{url}")],
+        [InlineKeyboardButton("⭕ Aylana",      callback_data=f"DL|circle|best|{url}"),
+         InlineKeyboardButton("ℹ️ Ma'lumot",   callback_data=f"DL|info|best|{url}")],
+    ]
+    await update.message.reply_text("⬇️ *Qanday yuklab olasiz?*",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb))
+
+async def dl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split("|", 3)
+    if len(parts) < 4: return
+    _, mode, quality, url = parts
+    uid = query.from_user.id
+
+    msg = await query.message.reply_text("⏳ Yuklab olinmoqda...")
+    try:
+        if mode == "info":
+            await _video_info(query, url, msg)
+            return
+
+        is_audio  = mode == "audio"
+        is_circle = mode == "circle"
+        result = await ydl(url, audio_only=(is_audio or is_circle), quality=quality)
+
+        if not result["data"]:
+            await msg.edit_text("❌ Yuklab bo'lmadi.")
+            return
+
+        cap   = f"🎬 *{result['title']}*\n👤 {result['uploader']}\n⏱ {fmt_dur(result['duration'])}"
+        thumb = BytesIO(result["thumb"]) if result.get("thumb") else None
+
+        if is_audio:
+            await query.message.reply_audio(audio=BytesIO(result["data"]),
+                caption=cap, parse_mode=ParseMode.MARKDOWN,
+                title=result["title"], performer=result["uploader"],
+                thumbnail=thumb)
+            record(uid, "music")
+
+        elif is_circle:
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                f.write(result["data"]); inp = f.name
+            tmp_mp4 = inp.replace(".mp3", "_tmp.mp4")
+            run_ff(["-i", inp, "-c:v", "libx264", "-c:a", "aac", tmp_mp4])
+            src = tmp_mp4 if os.path.exists(tmp_mp4) else inp
+            final = make_circle(src)
+            if final and os.path.exists(final):
+                await query.message.reply_video_note(
+                    video_note=BytesIO(open(final, "rb").read()),
+                    duration=result["duration"] or 0, length=512)
+                os.unlink(final)
+            else:
+                await query.message.reply_audio(audio=BytesIO(result["data"]),
+                    caption=cap, parse_mode=ParseMode.MARKDOWN)
+            for p in [inp, tmp_mp4]:
+                try: os.unlink(p)
+                except: pass
+            record(uid, "dl")
+
+        else:
+            await query.message.reply_video(video=BytesIO(result["data"]),
+                caption=cap, parse_mode=ParseMode.MARKDOWN,
+                supports_streaming=True, thumbnail=thumb)
+            record(uid, "dl")
+
+        await msg.delete()
+
+    except Exception as e:
+        await msg.edit_text(f"❌ Xato: `{str(e)[:250]}`", parse_mode=ParseMode.MARKDOWN)
+
+async def _video_info(query, url: str, msg):
+    def _get():
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True}) as ydl_:
+            return ydl_.extract_info(url, download=False)
+    try:
+        info = await asyncio.get_event_loop().run_in_executor(None, _get)
+        text = (
+            f"ℹ️ *Video ma'lumoti*\n\n"
+            f"📌 *{info.get('title','?')}*\n"
+            f"👤 {info.get('uploader','?')}\n"
+            f"⏱ {fmt_dur(info.get('duration',0))}\n"
+            f"👁 {fmt_num(info.get('view_count',0))} ko'rish\n"
+            f"👍 {fmt_num(info.get('like_count',0))} layk\n"
+            f"🎞 {len(info.get('formats',[]))} format mavjud\n\n"
+            f"📝 {(info.get('description') or '')[:300]}"
+        )
+        kb = [[
+            InlineKeyboardButton("🎬 Yuklab olish", callback_data=f"DL|video|best|{url}"),
+            InlineKeyboardButton("🎵 MP3", callback_data=f"DL|audio|best|{url}"),
+        ]]
+        thumb = info.get("thumbnail", "")
+        if thumb:
+            async with httpx.AsyncClient(timeout=15) as c:
+                ir = await c.get(thumb)
+            await msg.delete()
+            await query.message.reply_photo(photo=BytesIO(ir.content),
+                caption=text[:1024], parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup(kb))
+        else:
+            await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup(kb))
+    except Exception as e:
+        await msg.edit_text(f"❌ {str(e)[:200]}")
+
+# ═══════════════════════════════════════════════════════════
+# MUSIQA
+# ═══════════════════════════════════════════════════════════
+
+async def cmd_music(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if is_banned(uid): return
+    if not context.args:
+        await update.message.reply_text("🎵 `/music <qo'shiq nomi>`", parse_mode=ParseMode.MARKDOWN)
+        return
+    q = " ".join(context.args)
+    await typing(update)
+    msg = await update.message.reply_text(f"🔍 *{q}* qidirilmoqda...", parse_mode=ParseMode.MARKDOWN)
+
+    spotify = sp()
+    text = f"🎵 *{q}* natijalari:\n\n"
+    kb = []
+    thumb_url = None
+
+    if spotify:
         try:
-            time.sleep(14*60)
-            urllib.request.urlopen(url+"/health", timeout=10)
+            res = spotify.search(q=q, type="track", limit=6)
+            for i, t in enumerate(res["tracks"]["items"]):
+                name   = t["name"]
+                artist = t["artists"][0]["name"]
+                m, s   = divmod(t["duration_ms"] // 1000, 60)
+                if t["album"]["images"] and not thumb_url:
+                    thumb_url = t["album"]["images"][0]["url"]
+                text += f"{i+1}. 🎵 *{name}*\n   👤 {artist} | ⏱ {m}:{s:02d}\n\n"
+                kb.append([InlineKeyboardButton(
+                    f"⬇️ {name[:28]} — {artist[:18]}",
+                    callback_data=f"MUSIC|sp|{name}|{artist}")])
         except: pass
 
-def run_bot():
-    while True:
-        try: bot.infinity_polling(timeout=10, long_polling_timeout=5)
-        except Exception as e: log.error(e); time.sleep(5)
+    if not kb and YTSEARCH_OK:
+        try:
+            for item in VideosSearch(q + " official audio", limit=5).result()["result"]:
+                text += f"• *{item['title']}*\n  👤 {item['channel']['name']}\n\n"
+                kb.append([InlineKeyboardButton(f"⬇️ {item['title'][:40]}",
+                    callback_data=f"MUSIC|yt|{item['link']}|_")])
+        except: pass
+
+    if not kb:
+        await msg.edit_text("❌ Topilmadi."); return
+
+    rm = InlineKeyboardMarkup(kb)
+    if thumb_url:
+        async with httpx.AsyncClient(timeout=15) as c:
+            ir = await c.get(thumb_url)
+        await msg.delete()
+        await update.message.reply_photo(photo=BytesIO(ir.content),
+            caption=text[:1024], reply_markup=rm, parse_mode=ParseMode.MARKDOWN)
+    else:
+        await msg.edit_text(text[:3000], reply_markup=rm, parse_mode=ParseMode.MARKDOWN)
+
+async def music_dl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, src, a, b = query.data.split("|", 3)
+    uid = query.from_user.id
+    msg = await query.message.reply_text("⏳ Musiqa yuklab olinmoqda...")
+    try:
+        if src == "yt":
+            url = a
+        elif YTSEARCH_OK:
+            items = VideosSearch(f"{a} {b} audio", limit=1).result()["result"]
+            if not items:
+                await msg.edit_text("❌ Topilmadi."); return
+            url = items[0]["link"]
+        else:
+            await msg.edit_text("❌ YouTube search yo'q."); return
+
+        result = await ydl(url, audio_only=True)
+        if not result["data"]:
+            await msg.edit_text("❌ Yuklab bo'lmadi."); return
+
+        thumb = BytesIO(result["thumb"]) if result.get("thumb") else None
+        await query.message.reply_audio(audio=BytesIO(result["data"]),
+            title=result["title"], performer=result["uploader"],
+            thumbnail=thumb,
+            caption=f"🎵 *{result['title']}*", parse_mode=ParseMode.MARKDOWN)
+        record(uid, "music")
+        await msg.delete()
+    except Exception as e:
+        await msg.edit_text(f"❌ {str(e)[:200]}")
+
+# ═══════════════════════════════════════════════════════════
+# LYRICS
+# ═══════════════════════════════════════════════════════════
+
+async def cmd_lyrics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_banned(update.effective_user.id): return
+    if not context.args:
+        await update.message.reply_text("📝 `/lyrics <qo'shiq nomi>`", parse_mode=ParseMode.MARKDOWN)
+        return
+    q = " ".join(context.args)
+    await typing(update)
+    msg = await update.message.reply_text(f"🔍 *{q}* matni...", parse_mode=ParseMode.MARKDOWN)
+    genius = gn()
+    if not genius:
+        await msg.edit_text("❌ `GENIUS_TOKEN` sozlanmagan.", parse_mode=ParseMode.MARKDOWN)
+        return
+    try:
+        song = await asyncio.get_event_loop().run_in_executor(None, lambda: genius.search_song(q))
+        if not song:
+            await msg.edit_text("❌ Topilmadi."); return
+        lyr  = song.lyrics[:3500] + "..." if len(song.lyrics) > 3500 else song.lyrics
+        text = f"🎵 *{song.title}*\n👤 _{song.artist}_\n\n{lyr}"
+        if song.song_art_image_url:
+            async with httpx.AsyncClient(timeout=15) as c:
+                ir = await c.get(song.song_art_image_url)
+            await msg.delete()
+            await update.message.reply_photo(photo=BytesIO(ir.content),
+                caption=text[:1024], parse_mode=ParseMode.MARKDOWN)
+            for i in range(1024, len(text), 4000):
+                await update.message.reply_text(text[i:i+4000], parse_mode=ParseMode.MARKDOWN)
+        else:
+            for i, start in enumerate(range(0, len(text), 4000)):
+                chunk = text[start:start+4000]
+                if i == 0: await msg.edit_text(chunk, parse_mode=ParseMode.MARKDOWN)
+                else: await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await msg.edit_text(f"❌ {str(e)[:200]}")
+
+# ═══════════════════════════════════════════════════════════
+# KINO
+# ═══════════════════════════════════════════════════════════
+
+def _movie_text(d: dict) -> str:
+    title    = d.get("title") or d.get("name") or "?"
+    orig     = d.get("original_title") or d.get("original_name") or ""
+    year     = (d.get("release_date") or d.get("first_air_date") or "")[:4]
+    rating   = d.get("vote_average", 0)
+    votes    = d.get("vote_count", 0)
+    genres   = ", ".join(g["name"] for g in d.get("genres", []))
+    overview = (d.get("overview") or "")[:500]
+    runtime  = d.get("runtime") or (d.get("episode_run_time") or [None])[0]
+    cast     = ", ".join(a["name"] for a in d.get("credits", {}).get("cast", [])[:5])
+    dirs     = ", ".join(p["name"] for p in d.get("credits", {}).get("crew", [])
+                         if p.get("job") == "Director")[:2]
+    trailer  = next((v["key"] for v in d.get("videos", {}).get("results", [])
+                     if v.get("type") == "Trailer" and v.get("site") == "YouTube"), None)
+
+    return (
+        f"🎬 *{title}*" + (f" _({orig})_" if orig and orig != title else "")
+        + (f" ({year})" if year else "") + "\n\n"
+        + (f"⭐ *{rating:.1f}/10*  ({fmt_num(votes)} ovoz)\n" if rating else "")
+        + (f"🎭 {genres}\n" if genres else "")
+        + (f"⏱ {runtime} min\n" if runtime else "")
+        + (f"🎬 Rejissyor: {dirs}\n" if dirs else "")
+        + (f"👥 {cast}\n" if cast else "")
+        + (f"\n📖 {overview}" if overview else "")
+        + (f"\n\n🎞 [Treyler izlash](https://youtu.be/{trailer})" if trailer else "")
+    )
+
+async def cmd_movie(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_banned(update.effective_user.id): return
+    if not context.args:
+        await update.message.reply_text("🎬 `/movie <kino nomi>`", parse_mode=ParseMode.MARKDOWN)
+        return
+    if not TMDB_API_KEY:
+        await update.message.reply_text("❌ `TMDB_API_KEY` sozlanmagan.", parse_mode=ParseMode.MARKDOWN)
+        return
+    q = " ".join(context.args)
+    await typing(update)
+    msg = await update.message.reply_text(f"🔍 *{q}* qidirilmoqda...", parse_mode=ParseMode.MARKDOWN)
+    results = await tmdb_search(q)
+    if not results:
+        await msg.edit_text("❌ Topilmadi."); return
+
+    if len(results) == 1:
+        await _send_movie(update.message, msg, results[0]); return
+
+    text = f"🎬 *{q}* natijalari:\n\n"
+    kb = []
+    for r in results[:6]:
+        t  = r.get("title") or r.get("name") or "?"
+        yr = (r.get("release_date") or r.get("first_air_date") or "")[:4]
+        mt = r.get("media_type", "movie")
+        rt = r.get("vote_average", 0)
+        text += f"• *{t}* ({yr}) ⭐{rt:.1f}\n"
+        kb.append([InlineKeyboardButton(
+            f"{'🎬' if mt=='movie' else '📺'} {t[:35]} ({yr})",
+            callback_data=f"MOV|{r['id']}|{mt}")])
+    await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+
+async def movie_sel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, mid, mt = query.data.split("|")
+    msg = await query.message.reply_text("⏳...")
+    d = await tmdb_detail(int(mid), mt)
+    if not d:
+        await msg.edit_text("❌ Topilmadi."); return
+    await _send_movie_detail(query.message, msg, d)
+
+async def _send_movie(message, msg, r: dict):
+    d = await tmdb_detail(r["id"], r.get("media_type", "movie")) or r
+    await _send_movie_detail(message, msg, d)
+
+async def _send_movie_detail(message, msg, d: dict):
+    text   = _movie_text(d)
+    poster = d.get("poster_path") or d.get("backdrop_path")
+    title  = d.get("title") or d.get("name") or ""
+    kb = [[InlineKeyboardButton("🔍 YouTube treyler",
+        url=f"https://www.youtube.com/results?search_query={title.replace(' ','+')}+trailer")]]
+    if poster:
+        img = await tmdb_img(poster)
+        if img:
+            await msg.delete()
+            await message.reply_photo(photo=BytesIO(img), caption=text[:1024],
+                parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb))
+            if len(text) > 1024:
+                await message.reply_text(text[1024:4000], parse_mode=ParseMode.MARKDOWN)
+            return
+    await msg.edit_text(text[:4000], parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb))
+
+async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_banned(update.effective_user.id): return
+    if not TMDB_API_KEY:
+        await update.message.reply_text("❌ `TMDB_API_KEY` sozlanmagan.", parse_mode=ParseMode.MARKDOWN)
+        return
+    await typing(update)
+    msg = await update.message.reply_text("📊 Trend kinolar yuklanmoqda...")
+    items = await tmdb_trending()
+    if not items:
+        await msg.edit_text("❌ Topilmadi."); return
+    text = "📊 *Bu haftaning eng zo'r kinolari:*\n\n"
+    kb = []
+    for i, r in enumerate(items, 1):
+        t  = r.get("title") or r.get("name") or "?"
+        yr = (r.get("release_date") or r.get("first_air_date") or "")[:4]
+        mt = r.get("media_type", "movie")
+        rt = r.get("vote_average", 0)
+        icon = "🎬" if mt == "movie" else "📺"
+        text += f"{i}. {icon} *{t}* ({yr}) ⭐{rt:.1f}\n"
+        kb.append([InlineKeyboardButton(f"{icon} {t[:38]} ({yr})",
+            callback_data=f"MOV|{r['id']}|{mt}")])
+    await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+
+# ─── Rasmdan kino topish ──────────────────────────────────
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if is_banned(uid): return
+
+    photo = update.message.photo[-1]
+    msg = await update.message.reply_text(
+        "🔍 *Rasm tahlil qilinmoqda...*\n_(Yandex Reverse Image Search)_",
+        parse_mode=ParseMode.MARKDOWN)
+
+    try:
+        tg_file = await photo.get_file()
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            await tg_file.download_to_drive(f.name); img_path = f.name
+        img_bytes = Image.open(img_path).convert("RGB")
+        buf = BytesIO()
+        img_bytes.save(buf, "JPEG", quality=85)
+        img_data = buf.getvalue()
+        os.unlink(img_path)
+
+        keyword = await yandex_reverse(img_data)
+        if not keyword:
+            await msg.edit_text("🔍 *Google Lens sinab ko'rilmoqda...*", parse_mode=ParseMode.MARKDOWN)
+            keyword = await google_lens(img_data)
+
+        if not keyword:
+            await msg.edit_text(
+                "❌ Rasmdan topib bo'lmadi.\n\n"
+                "💡 Yaxshiroq kino posteri yuboring\n"
+                "yoki: `/movie <kino nomi>`", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        await msg.edit_text(f"✅ *{keyword}* — TMDB da qidirilmoqda...",
+            parse_mode=ParseMode.MARKDOWN)
+
+        if not TMDB_API_KEY:
+            await msg.edit_text(
+                f"🔍 Topildi: *{keyword}*\n\n❌ TMDB kerak: `/movie {keyword}`",
+                parse_mode=ParseMode.MARKDOWN)
+            return
+
+        results = await tmdb_search(keyword)
+        if not results:
+            results = await tmdb_search(" ".join(keyword.split()[:3]))
+
+        if not results:
+            await msg.edit_text(
+                f"🔍 Rasm: *{keyword}*\n\n❌ TMDB da topilmadi.\n`/movie {keyword}`",
+                parse_mode=ParseMode.MARKDOWN)
+            return
+
+        record(uid, "movies")
+
+        if len(results) == 1:
+            await _send_movie(update.message, msg, results[0])
+        else:
+            text = f"🔍 Rasm: *{keyword}*\n\nQaysi kinoni tanlaysiz?\n\n"
+            kb = []
+            for r in results[:5]:
+                t  = r.get("title") or r.get("name") or "?"
+                yr = (r.get("release_date") or r.get("first_air_date") or "")[:4]
+                mt = r.get("media_type", "movie")
+                rt = r.get("vote_average", 0)
+                text += f"• *{t}* ({yr}) ⭐{rt:.1f}\n"
+                kb.append([InlineKeyboardButton(
+                    f"{'🎬' if mt=='movie' else '📺'} {t[:35]} ({yr})",
+                    callback_data=f"MOV|{r['id']}|{mt}")])
+            await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(kb),
+                parse_mode=ParseMode.MARKDOWN)
+
+    except Exception as e:
+        await msg.edit_text(f"❌ Xato: {str(e)[:200]}")
+
+# ═══════════════════════════════════════════════════════════
+# AUDIO EFFECTS
+# ═══════════════════════════════════════════════════════════
+
+async def cmd_effect(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_banned(update.effective_user.id): return
+    context.user_data["effect_waiting"] = True
+    context.user_data["effect_id"] = None
+    kb = []
+    row = []
+    for eid, ename in AUDIO_EFFECTS.items():
+        row.append(InlineKeyboardButton(ename, callback_data=f"EFF|{eid}"))
+        if len(row) == 2: kb.append(row); row = []
+    if row: kb.append(row)
+    await update.message.reply_text(
+        "🎛 *Effektni tanlang, keyin audio yuboring:*",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb))
+
+async def eff_sel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, eid = query.data.split("|")
+    context.user_data["effect_waiting"] = True
+    context.user_data["effect_id"] = eid
+    await query.message.reply_text(
+        f"✅ *{AUDIO_EFFECTS[eid]}* tanlandi.\n\n🎵 Audio faylni yuboring:",
+        parse_mode=ParseMode.MARKDOWN)
+
+async def _do_effect(update: Update, context: ContextTypes.DEFAULT_TYPE, af) -> bool:
+    if not context.user_data.get("effect_waiting"): return False
+    eid = context.user_data.get("effect_id")
+    if not eid:
+        kb = []
+        row = []
+        for e, n in AUDIO_EFFECTS.items():
+            row.append(InlineKeyboardButton(n, callback_data=f"EFF|{e}"))
+            if len(row) == 2: kb.append(row); row = []
+        if row: kb.append(row)
+        await update.message.reply_text("🎛 Avval effektni tanlang:",
+            reply_markup=InlineKeyboardMarkup(kb))
+        return True
+
+    ename = AUDIO_EFFECTS[eid]
+    msg = await update.message.reply_text(f"⏳ *{ename}* qo'shilmoqda...", parse_mode=ParseMode.MARKDOWN)
+    uid = update.effective_user.id
+    try:
+        tgf = await af.get_file()
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            await tgf.download_to_drive(f.name); inp = f.name
+
+        def proc():
+            a = AudioSegment.from_file(inp)
+            out_a = fx(a, eid)
+            out = inp.replace(".mp3", f"_{eid}.mp3")
+            out_a.export(out, format="mp3", bitrate="320k")
+            data = open(out, "rb").read()
+            os.unlink(inp); os.unlink(out)
+            return data
+
+        data = await asyncio.get_event_loop().run_in_executor(None, proc)
+        await update.message.reply_audio(audio=BytesIO(data), title=ename,
+            caption=f"✅ *{ename}* effekti qo'shildi!", parse_mode=ParseMode.MARKDOWN)
+        await msg.delete()
+        record(uid, "effects")
+        context.user_data["effect_waiting"] = False
+        context.user_data["effect_id"] = None
+    except Exception as e:
+        await msg.edit_text(f"❌ {str(e)[:200]}")
+    return True
+
+# ═══════════════════════════════════════════════════════════
+# CIRCLE VIDEO
+# ═══════════════════════════════════════════════════════════
+
+async def cmd_circle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_banned(update.effective_user.id): return
+    context.user_data["circle_waiting"] = True
+    await update.message.reply_text("⭕ *Aylana Video*\n\nVideo faylni yuboring:",
+        parse_mode=ParseMode.MARKDOWN)
+
+async def _do_circle(update: Update, context: ContextTypes.DEFAULT_TYPE, vf) -> bool:
+    if not context.user_data.get("circle_waiting"): return False
+    msg = await update.message.reply_text("⏳ Aylana video tayyorlanmoqda...")
+    uid = update.effective_user.id
+    try:
+        tgf = await vf.get_file()
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            await tgf.download_to_drive(f.name); inp = f.name
+
+        final = await asyncio.get_event_loop().run_in_executor(None, make_circle, inp)
+        if final and os.path.exists(final):
+            dur = getattr(vf, "duration", 0) or 0
+            await update.message.reply_video_note(
+                video_note=BytesIO(open(final, "rb").read()), duration=dur, length=512)
+            os.unlink(final)
+        else:
+            await msg.edit_text("❌ Aylana video yaratib bo'lmadi. ffmpeg o'rnatilganmi?")
+            return True
+
+        os.unlink(inp)
+        await msg.delete()
+        record(uid, "dl")
+        context.user_data["circle_waiting"] = False
+    except Exception as e:
+        await msg.edit_text(f"❌ {str(e)[:200]}")
+    return True
+
+# ═══════════════════════════════════════════════════════════
+# ★ ADMIN PANEL — To'liq kuchli
+# ═══════════════════════════════════════════════════════════
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("❌ Siz admin emassiz.")
+        return
+
+    total = len(USER_INFO)
+    banned = sum(1 for u in USER_INFO.values() if u.get("banned"))
+    total_dl = sum(v["dl"] for v in STATS.values())
+    total_music = sum(v["music"] for v in STATS.values())
+    total_movies = sum(v["movies"] for v in STATS.values())
+    total_fx = sum(v["effects"] for v in STATS.values())
+
+    text = (
+        f"👑 *ADMIN PANEL*\n\n"
+        f"━━━━━ 📊 Statistika ━━━━━\n"
+        f"👥 Jami foydalanuvchilar: `{total}`\n"
+        f"🚫 Bloklangan: `{banned}`\n"
+        f"📥 Jami yuklab olish: `{total_dl}`\n"
+        f"🎵 Jami musiqa: `{total_music}`\n"
+        f"🎬 Jami kino qidirish: `{total_movies}`\n"
+        f"🎛 Jami effektlar: `{total_fx}`\n"
+    )
+    kb = [
+        [InlineKeyboardButton("👥 Foydalanuvchilar ro'yxati", callback_data="ADM|users|1")],
+        [InlineKeyboardButton("📢 Hammaga xabar yuborish",    callback_data="ADM|broadcast|0")],
+        [InlineKeyboardButton("🔍 Foydalanuvchini topish",    callback_data="ADM|search|0")],
+        [InlineKeyboardButton("🚫 Ban ro'yxati",              callback_data="ADM|banlist|0")],
+        [InlineKeyboardButton("📊 Top foydalanuvchilar",      callback_data="ADM|top|0")],
+        [InlineKeyboardButton("🗑 Statistikani tozalash",     callback_data="ADM|clearstats|0")],
+    ]
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(kb))
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    if not is_admin(uid):
+        await query.message.edit_text("❌ Ruxsat yo'q.")
+        return
+
+    parts = query.data.split("|")
+    action = parts[1]
+    back_kb = [[InlineKeyboardButton("⬅️ Admin panel", callback_data="ADM|back|0")]]
+
+    if action == "back":
+        # Admin panelni qayta ko'rsatish
+        total = len(USER_INFO)
+        banned = sum(1 for u in USER_INFO.values() if u.get("banned"))
+        total_dl = sum(v["dl"] for v in STATS.values())
+        total_music = sum(v["music"] for v in STATS.values())
+        text = (
+            f"👑 *ADMIN PANEL*\n\n"
+            f"👥 Foydalanuvchilar: `{total}` (🚫 ban: `{banned}`)\n"
+            f"📥 Yuklab olish: `{total_dl}`\n"
+            f"🎵 Musiqa: `{total_music}`\n"
+        )
+        kb = [
+            [InlineKeyboardButton("👥 Foydalanuvchilar ro'yxati", callback_data="ADM|users|1")],
+            [InlineKeyboardButton("📢 Hammaga xabar yuborish",    callback_data="ADM|broadcast|0")],
+            [InlineKeyboardButton("🔍 Foydalanuvchini topish",    callback_data="ADM|search|0")],
+            [InlineKeyboardButton("🚫 Ban ro'yxati",              callback_data="ADM|banlist|0")],
+            [InlineKeyboardButton("📊 Top foydalanuvchilar",      callback_data="ADM|top|0")],
+        ]
+        await query.message.edit_text(text, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(kb))
+
+    elif action == "users":
+        page = int(parts[2])
+        per_page = 10
+        users = list(USER_INFO.values())
+        total_pages = max(1, (len(users) + per_page - 1) // per_page)
+        page = max(1, min(page, total_pages))
+        chunk = users[(page-1)*per_page : page*per_page]
+
+        text = f"👥 *Foydalanuvchilar* ({len(users)} ta) — {page}/{total_pages} sahifa\n\n"
+        kb = []
+        for u in chunk:
+            bid = u["id"]
+            ban_icon = "🚫 " if u.get("banned") else ""
+            uname = f"@{u['username']}" if u.get("username") else ""
+            text += f"{ban_icon}`{bid}` — {u['name']} {uname}\n"
+            kb.append([
+                InlineKeyboardButton(f"{'✅ Ban ochish' if u.get('banned') else '🚫 Ban'}", callback_data=f"ADM|toggleban|{bid}"),
+                InlineKeyboardButton(f"📊 {u['name'][:15]}", callback_data=f"ADM|userstat|{bid}"),
+            ])
+
+        nav = []
+        if page > 1: nav.append(InlineKeyboardButton("⬅️", callback_data=f"ADM|users|{page-1}"))
+        if page < total_pages: nav.append(InlineKeyboardButton("➡️", callback_data=f"ADM|users|{page+1}"))
+        if nav: kb.append(nav)
+        kb.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="ADM|back|0")])
+        await query.message.edit_text(text, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(kb))
+
+    elif action == "toggleban":
+        target_id = int(parts[2])
+        if target_id in ADMIN_IDS:
+            await query.answer("❌ Adminni banlash mumkin emas!", show_alert=True)
+            return
+        if target_id not in USER_INFO:
+            await query.answer("❌ Foydalanuvchi topilmadi.", show_alert=True)
+            return
+        USER_INFO[target_id]["banned"] = not USER_INFO[target_id].get("banned", False)
+        status = "🚫 Bloklandi" if USER_INFO[target_id]["banned"] else "✅ Blokdan chiqarildi"
+        uname = USER_INFO[target_id].get("name", str(target_id))
+        await query.answer(f"{status}: {uname}", show_alert=True)
+        # Sahifani yangilash
+        await admin_callback(update, context)  # users ni qayta ko'rsatish
+        # Back to users page 1
+        parts[2] = "1"
+        query.data = "ADM|users|1"
+        await admin_callback(update, context)
+
+    elif action == "userstat":
+        target_id = int(parts[2])
+        u = USER_INFO.get(target_id, {})
+        s = STATS.get(target_id, {})
+        total_act = s.get("dl",0) + s.get("music",0) + s.get("movies",0) + s.get("effects",0)
+        ban_status = "🚫 Bloklangan" if u.get("banned") else "✅ Faol"
+        uname = f"@{u['username']}" if u.get("username") else "—"
+        text = (
+            f"👤 *Foydalanuvchi ma'lumoti*\n\n"
+            f"🆔 ID: `{target_id}`\n"
+            f"👤 Ism: {u.get('name','?')}\n"
+            f"📛 Username: {uname}\n"
+            f"📅 Qo'shilgan: {s.get('joined','?')}\n"
+            f"🔒 Status: {ban_status}\n\n"
+            f"📊 *Faoliyat:*\n"
+            f"📥 Yuklab olish: `{s.get('dl',0)}`\n"
+            f"🎵 Musiqa: `{s.get('music',0)}`\n"
+            f"🎬 Kino: `{s.get('movies',0)}`\n"
+            f"🎛 Effektlar: `{s.get('effects',0)}`\n"
+            f"📈 Jami: `{total_act}`"
+        )
+        ban_txt = "✅ Blokdan chiqarish" if u.get("banned") else "🚫 Bloklash"
+        kb = [
+            [InlineKeyboardButton(ban_txt, callback_data=f"ADM|toggleban|{target_id}")],
+            [InlineKeyboardButton("📢 Xabar yuborish", callback_data=f"ADM|msguser|{target_id}")],
+            [InlineKeyboardButton("⬅️ Orqaga", callback_data="ADM|users|1")],
+        ]
+        await query.message.edit_text(text, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(kb))
+
+    elif action == "msguser":
+        target_id = int(parts[2])
+        context.user_data["msg_to_user"] = target_id
+        await query.message.edit_text(
+            f"✉️ `{target_id}` ga xabar yozing:\n_(keyingi xabaringiz o'sha foydalanuvchiga yuboriladi)_",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(back_kb))
+
+    elif action == "broadcast":
+        context.user_data["broadcast_mode"] = True
+        count = len([u for u in USER_INFO.values() if not u.get("banned")])
+        await query.message.edit_text(
+            f"📢 *Hammaga xabar yuborish*\n\n"
+            f"👥 Qabul qiluvchilar: *{count}* ta faol foydalanuvchi\n\n"
+            f"Xabaringizni yozing (matn, rasm, video — barchasi qabul qilinadi):",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(back_kb))
+
+    elif action == "search":
+        context.user_data["admin_search"] = True
+        await query.message.edit_text(
+            "🔍 Foydalanuvchi ID yoki username ni yozing:",
+            reply_markup=InlineKeyboardMarkup(back_kb))
+
+    elif action == "banlist":
+        banned_users = [u for u in USER_INFO.values() if u.get("banned")]
+        if not banned_users:
+            await query.message.edit_text("✅ Bloklangan foydalanuvchi yo'q.",
+                reply_markup=InlineKeyboardMarkup(back_kb))
+            return
+        text = f"🚫 *Ban ro'yxati* ({len(banned_users)} ta):\n\n"
+        kb = []
+        for u in banned_users[:20]:
+            text += f"• `{u['id']}` — {u['name']}\n"
+            kb.append([InlineKeyboardButton(
+                f"✅ {u['name'][:20]} unban",
+                callback_data=f"ADM|toggleban|{u['id']}")])
+        kb.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="ADM|back|0")])
+        await query.message.edit_text(text, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(kb))
+
+    elif action == "top":
+        top = sorted(STATS.items(),
+            key=lambda x: x[1]["dl"] + x[1]["music"] + x[1]["movies"],
+            reverse=True)[:10]
+        text = "📊 *Top 10 faol foydalanuvchilar:*\n\n"
+        for i, (uid_, s) in enumerate(top, 1):
+            name = USER_INFO.get(uid_, {}).get("name", str(uid_))
+            total_act = s["dl"] + s["music"] + s["movies"]
+            text += f"{i}. *{name}* — `{total_act}` ta harakatlar\n"
+        await query.message.edit_text(text, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(back_kb))
+
+    elif action == "clearstats":
+        kb = [
+            [InlineKeyboardButton("✅ Ha, tozala", callback_data="ADM|clearconfirm|0"),
+             InlineKeyboardButton("❌ Bekor", callback_data="ADM|back|0")],
+        ]
+        await query.message.edit_text(
+            "⚠️ *Haqiqatan ham barcha statistikani tozalashni xohlaysizmi?*",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb))
+
+    elif action == "clearconfirm":
+        for uid_ in list(STATS.keys()):
+            STATS[uid_] = {"dl": 0, "music": 0, "movies": 0, "effects": 0,
+                           "joined": STATS[uid_].get("joined", "")}
+        await query.message.edit_text("✅ Barcha statistika tozalandi.",
+            reply_markup=InlineKeyboardMarkup(back_kb))
+
+# ═══════════════════════════════════════════════════════════
+# ADMIN — Broadcast va User message handling
+# ═══════════════════════════════════════════════════════════
+
+async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    uid = update.effective_user.id
+    if not is_admin(uid): return False
+
+    # Broadcast mode
+    if context.user_data.get("broadcast_mode"):
+        context.user_data["broadcast_mode"] = False
+        targets = [u_id for u_id, u in USER_INFO.items()
+                   if not u.get("banned") and u_id != uid]
+        msg = await update.message.reply_text(f"📢 Yuborilmoqda {len(targets)} ta foydalanuvchiga...")
+        ok = fail = 0
+        for t_id in targets:
+            try:
+                await update.message.copy_to(t_id)
+                ok += 1
+                await asyncio.sleep(0.05)
+            except:
+                fail += 1
+        await msg.edit_text(
+            f"✅ Yuborildi: *{ok}* ta\n❌ Xato: *{fail}* ta",
+            parse_mode=ParseMode.MARKDOWN)
+        return True
+
+    # Individual user message
+    if context.user_data.get("msg_to_user"):
+        t_id = context.user_data.pop("msg_to_user")
+        try:
+            await update.message.copy_to(t_id)
+            await update.message.reply_text(f"✅ `{t_id}` ga xabar yuborildi.",
+                parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Yuborib bo'lmadi: {e}")
+        return True
+
+    # Admin search
+    if context.user_data.get("admin_search"):
+        context.user_data["admin_search"] = False
+        q = (update.message.text or "").strip()
+        found = []
+        for u_id, u in USER_INFO.items():
+            if str(u_id) == q or u.get("username","").lower() == q.lstrip("@").lower():
+                found.append((u_id, u))
+        if not found:
+            await update.message.reply_text("❌ Topilmadi.")
+        else:
+            for u_id, u in found[:3]:
+                s = STATS.get(u_id, {})
+                ban_txt = "🚫 Bloklangan" if u.get("banned") else "✅ Faol"
+                text = (
+                    f"🔍 *Topildi*\n\n"
+                    f"🆔 `{u_id}`\n"
+                    f"👤 {u['name']}\n"
+                    f"📛 @{u.get('username','—')}\n"
+                    f"🔒 {ban_txt}\n"
+                    f"📅 {s.get('joined','?')}\n"
+                    f"📈 Jami: `{s.get('dl',0)+s.get('music',0)+s.get('movies',0)}`"
+                )
+                kb = [[
+                    InlineKeyboardButton(
+                        "✅ Blokdan chiqarish" if u.get("banned") else "🚫 Bloklash",
+                        callback_data=f"ADM|toggleban|{u_id}"),
+                    InlineKeyboardButton("📢 Xabar", callback_data=f"ADM|msguser|{u_id}"),
+                ]]
+                await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=InlineKeyboardMarkup(kb))
+        return True
+
+    return False
+
+# ═══════════════════════════════════════════════════════════
+# UNIVERSAL MESSAGE HANDLER
+# ═══════════════════════════════════════════════════════════
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message: return
+    user = update.effective_user
+    register_user(user)
+    uid = user.id
+
+    if is_banned(uid):
+        await update.message.reply_text("🚫 Siz bloklangansiz.")
+        return
+
+    # Admin actions (broadcast, search, msg_to_user)
+    if is_admin(uid):
+        handled = await admin_text_handler(update, context)
+        if handled: return
+
+    # Photo → kino topish
+    if update.message.photo:
+        await handle_photo(update, context)
+        return
+
+    # Audio → effekt
+    af = update.message.audio or update.message.voice
+    if not af and update.message.document:
+        mt = update.message.document.mime_type or ""
+        if "audio" in mt: af = update.message.document
+    if af:
+        handled = await _do_effect(update, context, af)
+        if handled: return
+
+    # Video → aylana
+    vf = update.message.video
+    if not vf and update.message.document:
+        mt = update.message.document.mime_type or ""
+        if "video" in mt: vf = update.message.document
+    if vf:
+        handled = await _do_circle(update, context, vf)
+        if handled: return
+
+    # URL → yuklab olish
+    text = (update.message.text or "").strip()
+    if is_url(text):
+        await handle_url(update, context)
+        return
+
+    # Boshqa matn
+    if text and not text.startswith("/"):
+        await update.message.reply_text(
+            "💡 Nima yuborishni bilmadim.\n\n"
+            "📥 Video havolasini yuboring\n"
+            "📸 Kino rasmini yuboring\n"
+            "❓ /help — yordam")
+
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    if isinstance(context.error, (TimedOut, NetworkError)): return
+    print(f"[ERR] {context.error}")
+
+# ═══════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════
+
+def main():
+    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("❌ BOT_TOKEN sozlanmagan! .env faylini to'ldiring.")
+        return
+
+    print("🤖 Pro Media Bot v3.0 ishga tushmoqda...")
+    if ADMIN_IDS:
+        print(f"👑 Adminlar: {ADMIN_IDS}")
+    if not TMDB_API_KEY:
+        print("⚠️  TMDB_API_KEY yo'q — kino ishlamaydi")
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("help",     lambda u, c: u.message.reply_text(
+        "❓ /music • /lyrics • /movie • /trending • /effect • /circle • /stats • /admin",
+        parse_mode=ParseMode.MARKDOWN)))
+    app.add_handler(CommandHandler("music",    cmd_music))
+    app.add_handler(CommandHandler("lyrics",   cmd_lyrics))
+    app.add_handler(CommandHandler("movie",    cmd_movie))
+    app.add_handler(CommandHandler("trending", cmd_trending))
+    app.add_handler(CommandHandler("effect",   cmd_effect))
+    app.add_handler(CommandHandler("circle",   cmd_circle))
+    app.add_handler(CommandHandler("stats",    lambda u, c: menu_callback(
+        type("FakeQuery", (), {"data": "MENU|stats", "from_user": u.effective_user,
+        "message": u.message, "answer": asyncio.coroutine(lambda: None)})(), c)
+    ))
+    app.add_handler(CommandHandler("admin",    cmd_admin))
+
+    app.add_handler(CallbackQueryHandler(platform_callback, pattern=r"^PLT\|"))
+    app.add_handler(CallbackQueryHandler(menu_callback,     pattern=r"^MENU\|"))
+    app.add_handler(CallbackQueryHandler(back_callback,     pattern=r"^BACK\|"))
+    app.add_handler(CallbackQueryHandler(dl_callback,       pattern=r"^DL\|"))
+    app.add_handler(CallbackQueryHandler(music_dl_callback, pattern=r"^MUSIC\|"))
+    app.add_handler(CallbackQueryHandler(movie_sel_callback,pattern=r"^MOV\|"))
+    app.add_handler(CallbackQueryHandler(eff_sel_callback,  pattern=r"^EFF\|"))
+    app.add_handler(CallbackQueryHandler(admin_callback,    pattern=r"^ADM\|"))
+
+    app.add_handler(MessageHandler(
+        filters.TEXT | filters.PHOTO | filters.AUDIO | filters.VOICE |
+        filters.VIDEO | filters.Document.ALL,
+        handle_message))
+
+    app.add_error_handler(error_handler)
+
+    print("✅ Bot tayyor! Polling boshlandi...\n")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
-    init_db()
-    threading.Thread(target=flask_start, daemon=True).start()
-    threading.Thread(target=keep_alive,  daemon=True).start()
-    run_bot()
+    main()
