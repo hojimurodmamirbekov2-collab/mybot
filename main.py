@@ -6,6 +6,8 @@ import tempfile
 import subprocess
 import json
 import math
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from io import BytesIO
 from datetime import datetime
 from collections import defaultdict
@@ -1692,11 +1694,25 @@ async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
     print(f"[ERR] {context.error}")
 
 
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, *args):
+        pass
+
+def _start_health_server():
+    port = int(os.getenv("PORT", 8000))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    server.serve_forever()
+
 def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("BOT_TOKEN sozlanmagan! .env faylini to'ldiring.")
         return
 
+    threading.Thread(target=_start_health_server, daemon=True).start()
     print("Pro Media Bot ishga tushmoqda...")
     if not TMDB_API_KEY:
         print("Eslatma: TMDB_API_KEY yo'q — kino funksiyasi ishlamaydi")
