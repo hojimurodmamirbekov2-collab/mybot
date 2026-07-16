@@ -296,14 +296,20 @@ def _tozala(ts):
         try: os.remove(x)
         except Exception: pass
 
-def _xato_kodi(e):
+def _xato_kodi(e, url=""):
     s = str(e).lower()
-    if "filesize" in s:                                   return "hajm"
-    if "private" in s:                                     return "yopiq"
-    if "age" in s:                                          return "yosh"
-    if "unavailab" in s or "not found" in s or "404" in s:  return "mavjud_emas"
-    if "login" in s or "cookie" in s or "rate-limit" in s or "429" in s: return "login"
-    return str(e)[:120]
+    u = (url or "").lower()
+    if "filesize" in s:                                     return "hajm"
+    if "private" in s:                                       return "yopiq"
+    if "age" in s:                                            return "yosh"
+    if "unavailab" in s or "not found" in s or "404" in s:    return "mavjud_emas"
+    if "unsupported url" in s and "/photo/" in u and "tiktok" in u: return "tiktok_rasm"
+    if "unsupported url" in s:                                 return "qollab_bolmaydi"
+    if "login" in s or "cookie" in s or "rate-limit" in s or "429" in s or "checkpoint" in s: return "login"
+    # Boshqa barcha kutilmagan (masalan platforma ichki API'sini bloklashi natijasidagi)
+    # xatolarni FOYDALANUVCHIGA xom holda ko'rsatmaymiz — faqat serverga logga yozamiz.
+    log.error(f"Aniqlanmagan yuklab olish xatosi: {e}")
+    return "notanish"
 
 def _ytdlp_urin(url, opts):
     """Bitta yt-dlp urinishi. Muvaffaqiyatli bo'lsa (nom,dur,muallif) qaytaradi, aks holda exception ko'taradi."""
@@ -366,10 +372,13 @@ def insta_yukla(url, max_mb=49):
     except Exception as e:
         log.error(f"Instaloader: {e}")
         s = str(e).lower()
-        xato = ("yopiq" if "private" in s else
-                "mavjud_emas" if "not found" in s else
-                "login" if "login" in s or "401" in s else
-                str(e)[:80])
+        if "private" in s:                       xato = "yopiq"
+        elif "not found" in s:                    xato = "mavjud_emas"
+        else:
+            # Instagram anonim so'rovlarni bloklaganda instaloader ko'pincha
+            # noaniq ichki xatolar beradi (masalan TypeError) — bunday holatlarni
+            # foydalanuvchiga xom holda chiqarmasdan "login kerak" deb ko'rsatamiz.
+            xato = "login"
         return None, None, 0, None, xato
     return None, None, 0, None, "login"
 
@@ -394,7 +403,7 @@ def tiktok_yukla(url, max_mb=49):
             oxirgi_xato = e
             _tozala(ts)
             continue
-    return None, None, 0, None, (_xato_kodi(oxirgi_xato) if oxirgi_xato else "topilmadi")
+    return None, None, 0, None, (_xato_kodi(oxirgi_xato, url) if oxirgi_xato else "topilmadi")
 
 def pinterest_yukla(url, max_mb=49):
     """Pinterest pinlari ko'pincha video emas, rasm bo'ladi — ikkalasini ham qo'llab-quvvatlaymiz."""
@@ -470,7 +479,7 @@ def media_yukla(url, audio=False, max_mb=49):
             return fayl, nom, dur, muallif, None, "audio"
         except Exception as e:
             _tozala(ts)
-            xato = _xato_kodi(e)
+            xato = _xato_kodi(e, url)
             log.error(f"Audio yuklab olish xato ({url[:60]}): {xato}")
             return None, None, 0, None, xato, "audio"
 
@@ -501,7 +510,7 @@ def media_yukla(url, audio=False, max_mb=49):
         return fayl, nom, dur, muallif, None, "video"
     except Exception as e:
         _tozala(ts)
-        xato = _xato_kodi(e)
+        xato = _xato_kodi(e, url)
         log.error(f"yt-dlp xato ({url[:60]}): {xato}")
         return None, None, 0, None, xato, "video"
 
@@ -681,17 +690,21 @@ def davomiylik(s):
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 XATO_MATN = {
-    "hajm":        f"❌ Fayl {MAX_MB} MB dan katta — bot yuklab bera olmaydi",
-    "yopiq":       "❌ Bu profil/video yopiq (private)",
-    "yosh":        "❌ Yosh chekloviga ega video",
-    "mavjud_emas": "❌ Video/rasm mavjud emas yoki o'chirilgan",
-    "video_emas":  "❌ Bu rasm post — video postlarni yuboring",
-    "login":       "❌ Bu havola login/cookie talab qiladi — hozircha ochiq (public) postlarni yuborishingiz kerak",
-    "topilmadi":   "❌ Fayl yuklab olinmadi",
-    "kichik":      "❌ Fayl bo'sh keldi — boshqa havola sinab ko'ring",
+    "hajm":            f"❌ Fayl {MAX_MB} MB dan katta — bot yuklab bera olmaydi",
+    "yopiq":           "❌ Bu profil/video yopiq (private)",
+    "yosh":            "❌ Yosh chekloviga ega video",
+    "mavjud_emas":     "❌ Video/rasm mavjud emas yoki o'chirilgan",
+    "video_emas":      "❌ Bu rasm post — video postlarni yuboring",
+    "login":           "❌ Bu havola hozircha yuklab bo'lmadi — platforma anonim yuklab olishni cheklagan bo'lishi mumkin.\n💡 Ochiq (public) profil/post ekanini tekshirib qayta urinib ko'ring",
+    "topilmadi":       "❌ Fayl yuklab olinmadi",
+    "kichik":          "❌ Fayl bo'sh keldi — boshqa havola sinab ko'ring",
+    "tiktok_rasm":     "❌ Bu TikTok foto/slaydshou post — bot faqat video postlarni yuklab bera oladi",
+    "qollab_bolmaydi": "❌ Bu turdagi havolani hozircha yuklab bo'lmaydi",
+    "url_noto'g'ri":   "❌ Havola formati noto'g'ri",
+    "notanish":        "❌ Yuklab bo'lmadi — biroz vaqtdan so'ng qayta urinib ko'ring",
 }
 def yuklab_xato(chat_id, xato):
-    yuborish(chat_id, XATO_MATN.get(xato, f"❌ Yuklab bo'lmadi:\n<code>{html_esc((xato or '')[:120])}</code>"), parse_mode="HTML")
+    yuborish(chat_id, XATO_MATN.get(xato, XATO_MATN["notanish"]), parse_mode="HTML")
 
 def url_mi(t):
     t = t.strip().lower()
